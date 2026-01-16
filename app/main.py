@@ -1,0 +1,1210 @@
+from fastapi import FastAPI, HTTPException,Query, Request,UploadFile,File,Depends,status
+from jose import JWTError, jwt
+import mysql.connector
+from mysql.connector import Error
+from datetime import datetime,date,timedelta
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
+from datetime import datetime, date
+from pydantic import BaseModel
+import pymysql
+import time
+import requests
+import pandas as pd
+import io 
+
+SECRET_KEY = "41b2ae40f9299813102265496f77665b12163f2386d4fc3ec7a8bcfa4ec56931"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+
+app = FastAPI()
+
+DB_CONFIG = {
+    "host": "192.168.15.177",
+    "user": "cron",
+    "password": "1234",
+    "database": "asterisk"
+}
+# WHITELISTED_IPS = {
+#     "192.168.15.104:5000"
+# }
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://192.168.15.104:5000",  # frontend origin (WITH port)
+        "http://localhost:5000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+        return username
+
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired or invalid"
+        )
+
+
+# @app.middleware("http")
+# async def ip_whitelist_middleware(request, call_next):
+#     client_ip = request.client.host
+
+#     if client_ip not in WHITELISTED_IPS:
+#         raise HTTPException(status_code=403, detail="IP not allowed")
+
+#     return await call_next(request)
+
+# @app.on_event("startup")
+# def startup_event():
+#     global db_connection
+#     try:
+#         db_connection = mysql.connector.connect(**DB_CONFIG)
+            
+#         print("✅ Database connected")
+#     except Error as e:
+#         print("❌ Database connection failed:", e)
+
+# @app.on_event("shutdown")
+# def shutdown_event():
+#     global db_connection
+#     if db_connection and db_connection.is_connected():
+#         db_connection.close()
+#         print("🛑 Database connection closed")
+
+#Calls Waiting
+@app.get('/getcallswaiting')
+def get_waitingcalls():
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+        query = """SELECT u.user AS agent_id, u.full_name AS agent_name, vla.campaign_id,vla.status,vla.calls_today AS calls_handled
+                    FROM vicidial_live_agents vla left JOIN vicidial_users u ON vla.user = u.user ORDER BY vla.status, vla.calls_today DESC;
+                    """ 
+        
+        
+                    # CASE WHEN vla.status = 'INCALL' THEN SEC_TO_TIME(UNIX_TIMESTAMP(NOW()) )
+                    #     ELSE '00:00:00' END AS talk_time,
+                    # CASE WHEN vla.status = 'READY' THEN SEC_TO_TIME(UNIX_TIMESTAMP(NOW()))
+                    #     ELSE '00:00:00' END AS wait_time
+        cursor.execute(query)
+        result = cursor.fetchall()
+        cursor.close() 
+        conn.close() 
+        return { "count": len(result), "data": result }
+
+    except Error as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def format_time(seconds):
+    if seconds is None:
+        return "00:00:00"
+    return time.strftime('%H:%M:%S', time.gmtime(int(seconds)))
+
+#Agents Time on Call Campaign
+@app.get('/getagnetstimeoncall')
+def get_waitingcalls():
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+        query = """
+                    SELECT extension  AS STATION,user AS USER,status AS STATUS,calls_today AS CALLS,
+                    (UNIX_TIMESTAMP(NOW()) - UNIX_TIMESTAMP(last_state_change))  AS TALK_TIME_SECONDS
+                    FROM vicidial_live_agents
+                    ORDER BY status;""" 
+        cursor.execute(query)
+        result = cursor.fetchall()
+        for row in result:
+            seconds = row.get("TALK_TIME_SECONDS", 0)
+            row["TALK_TIME_HH_MM_SS"] = format_time(seconds)
+
+        cursor.close()
+        conn.close() 
+        return { "count": len(result), "data": result }
+
+    except Error as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get('/get_all_data')
+def get_all_data():
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+        # today_start = datetime.combine(date.today(), datetime.min.time())
+        today_start = date.today()
+
+        # Dialer Level
+        query_dialer_level = """SELECT avg(auto_dial_level) AS dialer_level FROM vicidial_campaigns """
+        cursor.execute(query_dialer_level)
+        dialer_level_result = cursor.fetchall()
+        #get_all_data['dialer_level_result'] = cursor.fetchall()['dialer_level_result']
+
+        # Dialable Leads
+        query_dialable_leads = """SELECT COUNT(*) AS dialable_leads 
+                                  FROM vicidial_list vl 
+                                  JOIN vicidial_lists vli ON vl.list_id = vli.list_id 
+                                  WHERE vli.active = 'Y' AND vl.called_since_last_reset = 'N'"""
+        cursor.execute(query_dialable_leads)
+        dialable_leads_result = cursor.fetchall()
+
+        # Hopper Min/Max
+        query_hopper_min_max = """SELECT sum(hopper_level) AS min_hopper  FROM vicidial_campaigns """
+        cursor.execute(query_hopper_min_max)
+        hopper_min_max_result = cursor.fetchall()
+
+        # Leads in Hopper
+        query_leads_in_hopper = """SELECT COUNT(*) AS leads_in_hopper FROM vicidial_hopper WHERE status = 'READY'"""
+        cursor.execute(query_leads_in_hopper)
+        leads_in_hopper_result = cursor.fetchall()
+
+        # Trunk Short/Fill
+        query_trunk_short_fill = """SELECT GREATEST(COUNT(vh.lead_id) - (vc.auto_dial_level * COUNT(DISTINCT vla.user)),0) AS trunk_fill,
+                                    GREATEST((vc.auto_dial_level * COUNT(DISTINCT vla.user)) - COUNT(vh.lead_id),0) AS trunk_short
+                                    FROM vicidial_campaigns vc 
+                                    LEFT JOIN vicidial_live_agents vla ON vc.campaign_id = vla.campaign_id
+                                    LEFT JOIN vicidial_hopper vh ON vc.campaign_id = vh.campaign_id 
+                                    WHERE vc.active = 'Y'"""
+        cursor.execute(query_trunk_short_fill)
+        trunk_short_fill_result = cursor.fetchall()
+
+        # Calls Today
+        query_calls_today = """SELECT COUNT(*) AS calls_today FROM vicidial_log WHERE date(call_date) = %s"""
+        cursor.execute(query_calls_today, (today_start,))
+        calls_today_result = cursor.fetchall()
+
+        # Dropped / Answered
+        # query_drop_answer = """SELECT (SELECT COUNT(*) FROM vicidial_log WHERE status NOT IN ('DROP', 'DC', 'NA')) AS count_non_drop_dc_na,
+        #                        (SELECT COUNT(*) FROM vicidial_log WHERE status IN ('DROP', 'DC')) AS count_drop_dc
+        #                        WHERE call_date >= %s"""
+        # cursor.execute(query_drop_answer, (today_start,))
+        # drop_answer_result = cursor.fetchall()
+
+        # Drop Percentage
+        query_drop_percent = """SELECT ROUND((SUM(IF(status IN ('DROP','DC'),1,0)) / COUNT(*)) * 100, 2) AS dropped_percent
+                               FROM vicidial_log WHERE date(call_date) = %s"""
+        cursor.execute(query_drop_percent, (today_start,))
+        drop_percent_result = cursor.fetchall()
+
+        # Avg Agent
+        query_avg_agent = """SELECT COUNT(*) AS agents FROM vicidial_live_agents"""
+        cursor.execute(query_avg_agent)
+        avg_agent_result = cursor.fetchall()
+
+        # DL Diff
+        query_dl_diff = """SELECT ROUND(vc.auto_dial_level - (COUNT(vh.lead_id) / COUNT(vla.user)),2) AS dl_diff 
+                          FROM vicidial_campaigns vc
+                          LEFT JOIN vicidial_hopper vh ON vc.campaign_id = vh.campaign_id
+                          LEFT JOIN vicidial_live_agents vla ON vc.campaign_id = vla.campaign_id"""
+        cursor.execute(query_dl_diff)
+        dl_diff_result = cursor.fetchall()
+
+        # Diff
+        query_diff = """SELECT ROUND(((vc.auto_dial_level - (COUNT(vh.lead_id) / NULLIF(COUNT(vla.user), 0))) / vc.auto_dial_level) * 100, 2) AS diff_percent
+                        FROM vicidial_campaigns vc 
+                        LEFT JOIN vicidial_hopper vh ON vc.campaign_id = vh.campaign_id
+                        LEFT JOIN vicidial_live_agents vla ON vc.campaign_id = vla.campaign_id"""
+        cursor.execute(query_diff)
+        diff_result = cursor.fetchall()
+
+        # Dial Method
+        query_dial_method = """SELECT dial_method FROM vicidial_campaigns order by dial_method asc limit 1"""
+        cursor.execute(query_dial_method)
+        dial_method_result = cursor.fetchall()
+
+        # Status
+        query_status = """SELECT status FROM vicidial_campaign_statuses;"""
+        cursor.execute(query_status)
+        status_result = cursor.fetchall()
+
+        # Order
+        query_order = """SELECT Distinct lead_order FROM vicidial_campaigns"""
+        cursor.execute(query_order)
+        order_result = cursor.fetchall()
+
+        # Closing DB connection
+        cursor.close()
+        conn.close()
+
+        # Returning the consolidated results
+        return {
+            "dialer_level": dialer_level_result[0]["dialer_level"] if dialer_level_result else None,
+            "dialable_leads": dialable_leads_result[0]["dialable_leads"] if dialable_leads_result else 0,
+
+            "hopper_min_max": hopper_min_max_result[0]["min_hopper"] if hopper_min_max_result else None,
+
+            # "leads_in_hopper": leads_in_hopper_result[0]["leads_in_hopper"] if leads_in_hopper_result else 0,
+
+            "trunk_short_fill": trunk_short_fill_result[0] if trunk_short_fill_result else {
+                "trunk_fill": 0,
+                "trunk_short": 0
+            },
+            "calls_today": calls_today_result[0]["calls_today"] if calls_today_result else 0,
+
+            # "drop_answer": drop_answer_result[0] if drop_answer_result else None,
+
+            # "drop_percent": drop_percent_result[0]["dropped_percent"] if drop_percent_result else 0,
+
+            "avg_agent": avg_agent_result[0]["agents"] if avg_agent_result else 0,
+            "dl_diff": dl_diff_result[0]["dl_diff"] if dl_diff_result else 0,
+            "diff_percent": diff_result[0]["diff_percent"] if diff_result else 0,
+            "dial_method": dial_method_result[0]["dial_method"] if dial_method_result else None,
+
+            # "status": status_result,
+
+            "order": order_result[0]["lead_order"] if order_result else None
+        }
+
+
+
+    except Error as e:
+        raise HTTPException(status_code=500, detail=str(e))
+ 
+@app.get('/getcallbystatus')
+def get_calls_by_status():
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+
+        today_start = date.today()
+
+        query = """
+           SELECT 
+                COUNT(CASE WHEN status='INCALL' THEN 1 END) AS Incall,
+                COUNT(CASE WHEN status='PAUSED' THEN 1 END) AS Paused,
+                COUNT(CASE WHEN status='READY' THEN 1 END) AS Ready,
+                (
+                    SELECT COUNT(*) 
+                    FROM vicidial_log 
+                    WHERE DATE(call_date) = %s
+                ) AS Totalcall
+            FROM vicidial_live_agents;
+        """
+
+        cursor.execute(query, (today_start,))
+        result = cursor.fetchall()
+
+        cursor.close()
+        conn.close()
+
+        return {
+            "count": len(result),
+            "data": result
+        }
+
+    except Error as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def seconds_to_hhmmss(seconds):
+    seconds = int(seconds or 0)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02}:{m:02}:{s:02}"
+
+
+#Total Dials Today
+@app.get('/totaldialstoday')
+def get_totaldials(request:Request):
+    try:
+        # data = request.json()
+        # sd = data.get('sd')
+        # ed = data.get('ed')
+
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+        today_start = date.today()
+        query  = """ SELECT
+                        DATE(v.call_date) AS call_date,
+                        (select count(*)Total_calls from vicidial_log where date(call_date) = %s) AS total_dials,
+                        (select count(*) from vicidial_log where date(call_date) =%s  and length_in_sec > 0) AS connected_calls,
+                        ROUND((SUM(v.length_in_sec > 0) / COUNT(*)) * 100, 2 )  AS connection_rate_pct,
+                        (SELECT SUM(length_in_sec) FROM vicidial_log  WHERE DATE(call_date)= %s) AS total_talk_time,
+                        (select AVG(length_in_sec) from vicidial_log where date(call_date)= %s and length_in_sec >0 ) AS avg_talk_time_sec,
+                        COUNT(distinct v.lead_id) AS leads_connected,
+                        SUM(length_in_sec) AS total_seconds
+                    FROM vicidial_log v 
+                    where date(v.call_date) = %s GROUP BY DATE(v.call_date) ;
+                    """
+        cursor.execute(query,(today_start,today_start,today_start,today_start,today_start,))
+        result = cursor.fetchall()
+        for row in result:
+            row["total_talk_time"] = seconds_to_hhmmss(row["total_talk_time"])
+        cursor.close()
+        conn.close()
+        return {"data":result}
+    except Error as e:
+        raise HTTPException(status_code=500,detail=str(e))
+
+#Dialer Performance 
+@app.get('/dialerperformance')
+def get_dialerperformance():
+    try:    
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+        today_start = date.today()
+        query  = """ SELECT
+                        ROUND(COUNT(*) / NULLIF(
+                                (SELECT COUNT(DISTINCT user) FROM vicidial_live_agents), 0), 2) AS dial_level,
+                        ROUND((COUNT(*) / NULLIF((SELECT COUNT(DISTINCT user) FROM vicidial_live_agents), 0)) / 24, 2) AS calls_per_agent_per_hour,
+                        (
+                            SELECT  AVG(TIMESTAMPDIFF(SECOND, start_time, end_time)) AS avg_call_length
+                            FROM call_log
+                            WHERE DATE(start_time) = %s
+                        ) AS avg_answer_speed_sec,
+                        ROUND(SUM(vl.status IN ('DROP','ABANDON')) * 100.0 /NULLIF(
+                        (SELECT COUNT(*) FROM vicidial_dial_log WHERE DATE(call_date) = %s), 0), 2) AS drop_rate_percent,
+                        ROUND(AVG(vl.length_in_sec), 2) AS avg_call_length,
+                        ROUND((SUM(vl.length_in_sec > 0) / COUNT(*)) * 100, 2) AS connection_rate_percent
+                    FROM vicidial_log vl
+                    WHERE DATE(vl.call_date) = %s;
+                    """
+        cursor.execute(query,(today_start,today_start,today_start,))
+        result = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return {"data":result}
+    except Error as e:
+        raise HTTPException(status_code=500,detail=str(e))
+
+
+#Agent Productivity
+@app.get('/agentsproductivity')
+def get_agentsproductivity():
+    try:    
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+        today_start = date.today()
+        query  = """ SELECT vla.extension AS STATION, vla.user AS USER_ID,vu.full_name AS USER_NAME,vla.status AS STATUS,vla.calls_today AS CALLS,
+                        COUNT(vl.lead_id) AS connected_calls, MAX(vl.phone_number) AS phone_number,
+                        (UNIX_TIMESTAMP(NOW()) - UNIX_TIMESTAMP(vla.last_state_change)) AS TALK_TIME_SECONDS,
+                        SEC_TO_TIME(IFNULL(al.login_seconds, 0)) AS login_duration
+                        FROM vicidial_live_agents vla 
+                        left join vicidial_users vu on vla.user=vu.user
+                        LEFT JOIN vicidial_log vl ON vla.user = vl.user AND DATE(vl.call_date) = %s
+                        AND vl.length_in_sec > 0
+                        LEFT JOIN (
+                            SELECT
+                                user,
+                                SUM(pause_sec + wait_sec + talk_sec + dispo_sec) AS login_seconds
+                            FROM vicidial_agent_log
+                            WHERE DATE(event_time) = %s
+                            GROUP BY user
+                        ) al ON vla.user = al.user
+                        GROUP BY
+                            vla.extension,
+                            vla.user,
+                            vla.status,
+                            vla.calls_today,
+                            vla.last_state_change,
+                            al.login_seconds
+                        ORDER BY
+                            vla.status,
+                            vla.user;"""
+        cursor.execute(query,(today_start,today_start,))
+        result = cursor.fetchall()
+        for row in result:
+            seconds = row.get("TALK_TIME_SECONDS", 0)
+            row["TALK_TIME_HH_MM_SS"] = format_time(seconds)
+            if hasattr(row["login_duration"], "total_seconds"):
+                row["login_duration"] = seconds_to_hhmmss(
+                    row["login_duration"].total_seconds()
+                )
+        cursor.close()
+        conn.close()
+        return {"data":result}
+    except Error as e:
+        raise HTTPException(status_code=500,detail=str(e))
+
+
+#Agent Productivity
+@app.get('/campaignperformance')
+def get_campaignperformance():
+    try:    
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+        today_start = date.today()
+        query  = """ SELECT vl.campaign_id,COUNT(*) AS total_dials,SUM(vl.length_in_sec > 0) AS connected_calls,
+                        ROUND( (SUM(vl.length_in_sec > 0) / COUNT(*)) * 100, 2 ) AS connection_rate_pct,
+                        SEC_TO_TIME(SUM(vl.length_in_sec)) AS total_talk_time,
+                        AVG(vl.length_in_sec) AS avg_talk_time,
+                        ROUND( (SUM(vl.status = 'DROP') / COUNT(*)) * 100, 2 ) AS drop_rate_pct,
+                        SUM(vl.status IN ('SALE','SUCCESS','CONVERTED')) AS conversions FROM vicidial_log vl WHERE DATE(vl.call_date) = %s  GROUP BY vl.campaign_id
+                        ORDER BY total_dials DESC; """
+                                            
+        cursor.execute(query,(today_start,))
+        result = cursor.fetchall()
+        for row in result:
+            if hasattr(row["total_talk_time"], "total_seconds"):
+                row["total_talk_time"] = seconds_to_hhmmss(
+                    row["total_talk_time"].total_seconds()
+                )
+
+            # if hasattr(row["avg_talk_time"], "total_seconds"):
+            #     row["avg_talk_time"] = seconds_to_hhmmss(
+            #         row["avg_talk_time"].total_seconds()
+            #     )
+
+        
+        cursor.close()
+        conn.close()
+        return {"data":result}
+    except Error as e:
+        raise HTTPException(status_code=500,detail=str(e))
+
+
+
+#Compliance Review
+@app.get('/compliancereview')
+def get_compliancereview():
+    try:    
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+        today_start = date.today()
+        query  = """ SELECT distinct (SELECT COUNT(*) FROM vicidial_dnc_log dnc) AS dnd_violations,
+                        (SELECT COUNT(*) FROM vicidial_callbacks cb WHERE cb.callback_time >=%s) AS callback_sla_raised,
+                        (SELECT dial_method FROM vicidial_campaigns order by dial_method asc limit 1) AS dial_method,
+                        (SELECT sum(hopper_level) AS min_hopper  FROM vicidial_campaigns) AS hooper_level,
+                        (SELECT COUNT(*) FROM vicidial_callbacks cb WHERE cb.callback_time < %s AND cb.status != 'COMPLETE'
+                        ) AS callback_sla_missed,
+                        (SELECT CASE WHEN COUNT(*) > 10 THEN 'HIGH'
+                                    WHEN COUNT(*) BETWEEN 5 AND 10 THEN 'MEDIUM'
+                                    ELSE 'LOW'
+                                END FROM vicidial_dnc_log dnc
+                        ) AS risk_level
+                    FROM vicidial_log vl WHERE vl.call_date >= %s;"""
+                                            
+        cursor.execute(query,(today_start,today_start,today_start,))
+        result = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        return {"data":result}
+    except Error as e:
+        raise HTTPException(status_code=500,detail=str(e))
+
+#Lead Funnel
+@app.get('/leadfunnel')
+def get_LeadFunnel(request:Request):
+    try:
+        sd = request.query_params.get("sd")
+        ed = request.query_params.get("ed")
+        
+        print(sd, ed,"------------------1")
+    # start_date, end_date = resolve_date_range(sd, ed)
+
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+
+        if sd and ed:
+            # 🔹 Single date
+            query = """
+                SELECT
+                    COUNT(*) AS dialed,
+                    SUM(status IN ('IN','CBR','INTEREST','I')) AS Interested,
+                    SUM(length_in_sec > 0) AS connected,
+                    SUM(status IN ('CON','SUCCESS','CONVERTED')) AS converted,
+                    SUM(status IN ('EC')) AS existing_clients
+                FROM vicidial_log
+                WHERE date(call_date) BETWEEN %s AND %s
+            """
+            params = (
+                f"{sd}",
+                f"{ed}"
+            )
+        else:
+            today_start = date.today()
+            # 🔹 Date range
+            query = """
+                SELECT
+                    COUNT(*) AS dialed,
+                    SUM(status IN ('IN','CBR','INTEREST','I')) AS Interested,
+                    SUM(length_in_sec > 0) AS connected,
+                    SUM(status IN ('CON','SUCCESS','CONVERTED')) AS converted,
+                    SUM(status IN ('EC')) AS existing_clients
+                FROM vicidial_log
+                WHERE date(call_date)= %s
+            """
+            params = (
+                f"{today_start}",
+                
+            )
+
+        cursor.execute(query, params)
+        result = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+
+        return {"data": result}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+#Hourly Performance 
+@app.get('/hourlyperformance')
+def get_LeadFunnel():
+    try:    
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+        today_start = date.today()
+        query  = """ SELECT
+                        HOUR(call_date) AS hour,
+                        COUNT(*) AS total_calls,
+                        SUM(length_in_sec > 0) AS connected_calls
+                        FROM vicidial_log
+                        WHERE DATE(call_date)=%s
+                        GROUP BY HOUR(call_date)
+                        ORDER BY hour; """
+                                            
+        cursor.execute(query,(today_start,))
+        result = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        hours = []
+        total_calls =[]
+        connected_calls =[] 
+        for row in result:
+            hours.append(row["hour"])
+            total_calls.append(row["total_calls"])
+            connected_calls.append(row["connected_calls"])
+        return {
+            "hours":hours,
+            "total_calls":total_calls,
+            "connected_calls":connected_calls
+        }
+    except Error as e:
+        raise HTTPException(status_code=500,detail=str(e))
+    
+
+#Past Data For Graphs
+@app.get('/graphdata')
+def get_GraphData():
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+        query = """
+            SELECT DATE_FORMAT(vl.call_date, '%H:%i') AS time_slot,
+            ROUND((SUM(vl.length_in_sec > 0) / COUNT(*)) * 100, 2) AS connection_rate_percentage,
+            ROUND(SUM(vl.status IN ('DROP','ABANDON')) * 100.0 /NULLIF(
+                        (SELECT COUNT(*)
+                         FROM vicidial_dial_log vdl
+                         WHERE vdl.call_date BETWEEN NOW() - INTERVAL 2 HOUR AND NOW()
+                        ), 0
+                    ), 2
+                ) AS drop_rate_percentage
+            FROM vicidial_log vl
+            WHERE vl.call_date BETWEEN NOW() - INTERVAL 2 HOUR AND NOW()
+            GROUP BY FLOOR(UNIX_TIMESTAMP(vl.call_date) / 720)
+            ORDER BY time_slot DESC
+            LIMIT 10;
+        """
+
+        cursor.execute(query)
+        result = cursor.fetchall()
+        time_slot = []
+        connection_rate_percentage = []
+        drop_rate_percentage = []
+        for row in result:
+            time_slot.append(row["time_slot"])
+            connection_rate_percentage.append(row["connection_rate_percentage"])
+            drop_rate_percentage.append(row["drop_rate_percentage"])
+
+        cursor.close()
+        conn.close()
+
+        return {"time_slot": time_slot,"connection_rate_percentage":connection_rate_percentage,"drop_rate_percentage":drop_rate_percentage}
+
+    except Error as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+def resolve_date_range(sd=None, ed=None):
+    if sd and ed:
+        start_date = datetime.strptime(sd, "%Y-%m-%d")
+        end_date = datetime.strptime(ed, "%Y-%m-%d") + timedelta(days=1)
+    elif sd:  # single date selected
+        start_date = datetime.strptime(sd, "%Y-%m-%d")
+        end_date = start_date + timedelta(days=1)
+    else:  # today (default)
+        start_date = datetime.combine(date.today(), datetime.min.time())
+        end_date = datetime.now()
+
+    return start_date, end_date
+
+@app.get('/totaldialstodaydata')
+def get_totaldialsdata(request: Request):
+    try:
+        sd = request.query_params.get("sd")
+        ed = request.query_params.get("ed")
+
+        start_date, end_date = resolve_date_range(sd, ed)
+
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+
+        query = """ SELECT
+                        DATE(d.call_date) AS call_date,
+                        (select count(*)Total_calls from vicidial_log where date(call_date) BETWEEN %s AND %s) AS total_dials,
+                        (select count(*) from vicidial_log where date(call_date) BETWEEN %s AND %s  and length_in_sec > 0) AS connected_calls,
+                        ROUND((SUM(v.length_in_sec > 0) / COUNT(*)) * 100, 2 )  AS connection_rate_pct,
+                        (SELECT SUM(length_in_sec) FROM vicidial_log  WHERE DATE(call_date)BETWEEN %s AND %s) AS total_talk_time,
+                        AVG(v.length_in_sec) AS avg_talk_time_sec,
+                        COUNT(distinct v.lead_id) AS leads_connected,
+                        SUM(length_in_sec) AS total_seconds
+                    FROM vicidial_dial_log d
+                    LEFT JOIN vicidial_log v ON d.lead_id = v.lead_id AND d.call_date = v.call_date AND v.length_in_sec > 0
+                    where date(d.call_date) BETWEEN %s AND %s GROUP BY DATE(d.call_date) ;
+
+        """
+
+        cursor.execute(query, (start_date, end_date,start_date,end_date,start_date,end_date,start_date,end_date,))
+        result = cursor.fetchall()
+
+        for row in result:
+            row["total_talk_time"] = seconds_to_hhmmss(row["total_talk_time"])
+
+        cursor.close()
+        conn.close()
+
+        return {"data": result}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get('/leadfunnelwithdate')
+def get_LeadFunnel(request: Request):
+    try:
+        sd = request.query_params.get("sd")
+        ed = request.query_params.get("ed")
+        
+        print(sd, ed,"------------------150")
+    # start_date, end_date = resolve_date_range(sd, ed)
+
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+
+        if sd and ed:
+            # 🔹 Single date
+            query = """
+                SELECT
+                    COUNT(*) AS dialed,
+                    SUM(status IN ('IN','CBR','INTEREST','I')) AS Interested,
+                    SUM(length_in_sec > 0) AS connected,
+                    SUM(status IN ('CON','SUCCESS','CONVERTED')) AS converted,
+                    SUM(status IN ('EC')) AS existing_clients
+                FROM vicidial_log
+                WHERE date(call_date) BETWEEN %s AND %s
+            """
+            params = (
+                f"{sd}",
+                f"{ed}"
+            )
+        else:
+            today_start = date.today()
+            # 🔹 Date range
+            query = """
+                SELECT
+                    COUNT(*) AS dialed,
+                    SUM(status IN ('IN','CBR','INTEREST','I')) AS Interested,
+                    SUM(length_in_sec > 0) AS connected,
+                    SUM(status IN ('CON','SUCCESS','CONVERTED')) AS converted,
+                    SUM(status IN ('EC')) AS existing_clients
+                FROM vicidial_log
+                WHERE date(call_date)= %s
+            """
+            params = (
+                f"{today_start}",
+                
+            )
+
+        cursor.execute(query, params)
+        result = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+
+        return {"data": result}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+#preveous code 
+    # try:    
+    #     conn = mysql.connector.connect(**DB_CONFIG)
+    #     cursor = conn.cursor(dictionary=True)
+    #     today_start = date.today()
+    #     query  = """ SELECT COUNT(*) AS dialed,SUM(status IN ('IN','CBR','INTEREST','I')) AS Interested,
+    #                     SUM(length_in_sec > 0) AS connected,
+    #                     (SELECT COUNT(*) FROM vicidial_list WHERE status IN ('QUALIFIED','QCOK')) AS qualified,
+    #                     sUM(status IN ('CON','SUCCESS','CONVERTED')) AS converted,
+    #                     sum(status IN ('EC')) AS existing_clients
+    #                     FROM vicidial_log; """
+                                            
+    #     cursor.execute(query,)
+    #     result = cursor.fetchall()
+    #     cursor.close()
+    #     conn.close()
+    #     return {"data":result}
+    # except Error as e:
+    #     raise HTTPException(status_code=500,detail=str(e))
+    
+
+
+# Add leads 
+
+
+
+def normalize_phone(phone):
+    return str(phone).strip()[-10:]
+
+def load_existing_phones():
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT phone_number FROM vicidial_list")
+    phones = {normalize_phone(row[0]) for row in cursor.fetchall()}
+
+    cursor.close()
+    conn.close()
+    return phones
+
+
+vicidial_url = "http://192.168.15.177:8068/vicidial/non_agent_api.php"
+
+vici_user = 'AdminR'
+Vici_pass = 'AdminR'
+SOURCE = "FASTAPI"
+
+# @app.post("/upload_excel_leads")
+# def upload_excel_leads(file: UploadFile =File(...)):
+#     if not file.filename.endswith(".xlsx"):
+#         raise HTTPException(status_code=400 , detail="only .xlsx file allowed")
+
+#     try:
+#         contents = file.file.read()
+#         df = pd.read_excel(io.BytesIO(contents))
+#         print('file read-----------------')
+#     except Exception as e:
+#         raise HTTPException(status_code=400 , detail=f"invalid excel file : {e}")
+    
+#     required_columns = {"phone_number","list_id"}
+#     if not required_columns.issubset(df.columns):
+#         raise HTTPException(
+#             status_code=400, detail=f"Excel must contain columns : {required_columns}"
+#         )
+    
+
+#     existing_phones = load_existing_phones()
+
+#     success = 0
+#     failed = []
+
+#     for index,row in df.iterrows():
+#         phone = normalize_phone(row["phone_number"])
+
+#         if phone in existing_phones:
+#             failed.append({
+#                 "row": index + 2,
+#                 "phone": phone,
+#                 "error": "Duplicate phone (already exists)"
+#             })
+#             continue
+#         params={
+#             "source": SOURCE,
+#             "user" : vici_user,
+#             "pass" : Vici_pass,
+#             "function" : "add_lead",
+#             "phone_number" : row['phone_number'],
+#             "phone_code" : "1",
+#             "list_id" : row["list_id"],
+#             "first_name" : str(row.get("first_name","")),
+#             "last_name" : str(row.get("last_name","")),
+#             "campaign_id" : str(row.get("campaign_id",""))
+#         }
+
+#         try: 
+#             response = requests.get(vicidial_url,params=params ,timeout=10)
+
+#             if "SUCCESS" in response.text.upper():
+#                 success +=1 
+#             else:
+#                 failed.append({
+#                     "row": index +2,
+#                     "phone": row["phone_number"],
+#                     "error" : response.text
+#                 })
+
+#         except Exception as e: 
+#             failed.append({
+#                 "row" : index+2,
+#                 "phone" : row["phone_number"],
+#                 "error" : str(e)
+#             })
+
+#     return {
+#         "total_records": len(df),
+#         "success": success,
+#         "failed": len(failed),
+#         "failed_details": failed
+#     }
+
+
+#leads
+@app.get("/leads")
+def get_leads(request: Request,  current_user: str = Depends(get_current_user)):
+    try:
+        sd = request.query_params.get("sd")  # YYYY-MM-DD
+        ed = request.query_params.get("ed")  # YYYY-MM-DD
+        limit = int(request.query_params.get("limit", 50))
+
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+
+        
+        if sd and ed:
+            query = """
+            SELECT
+                DATE(vl.entry_date) AS entry_date,
+                vl.lead_id,
+                vl.phone_number,
+                vl.first_name,
+                vl.last_name,
+                vl.status,
+                vl.list_id,
+                vls.campaign_id,
+                vl.user
+            FROM vicidial_list vl JOIN vicidial_lists vls ON vl.list_id = vls.list_id
+            WHERE date(vl.entry_date) between  %s AND  %s
+            ORDER BY vl.entry_date DESC
+            LIMIT %s """
+            params = (sd, ed, limit)
+        else:
+            today_start = date.today()
+            query = """
+                SELECT
+                    DATE(vl.entry_date) AS entry_date,
+                    vl.lead_id,
+                    vl.phone_number,
+                    vl.first_name,
+                    vl.last_name,
+                    vl.status,
+                    vl.list_id,
+                    vls.campaign_id,
+                    vl.user
+                FROM vicidial_list vl JOIN vicidial_lists vls ON vl.list_id = vls.list_id
+                WHERE date(vl.entry_date) = %s
+                ORDER BY vl.entry_date DESC
+                LIMIT %s """
+
+            params = (today_start, limit)
+
+        cursor.execute(query, params)
+        data = cursor.fetchall()
+
+        cursor.close()
+        conn.close()
+
+        return {
+            "limit": limit,
+            "count": len(data),
+            "leads": data
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def clean_phone(value):
+    if value is None or value == "":
+        return ""
+
+    if isinstance(value, (int, float)):
+        value = str(int(value))
+
+    value = str(value).strip()
+
+    if value.endswith(".0"):
+        value = value[:-2]
+
+    return value
+
+#upload_excel_leads
+@app.post("/upload_excel_leads")
+def upload_excel_leads(file: UploadFile = File(...),  current_user: str = Depends(get_current_user)):
+
+    if not file.filename.endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Only .xlsx file allowed")
+
+    try:
+        contents = file.file.read()
+        df = pd.read_excel(io.BytesIO(contents))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid excel file: {e}")
+
+    # Normalize columns
+    df.columns = df.columns.str.strip().str.lower()
+
+    # Remove blank rows
+    df.dropna(how="all", inplace=True)
+
+    # Replace NaN
+    df.fillna("", inplace=True)
+
+    required_columns = {"phone_number", "list_id"}
+    if not required_columns.issubset(df.columns):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Excel must contain columns: {required_columns}"
+        )
+
+    existing_phones = load_existing_phones()
+
+    success = 0
+    failed = []
+    skipped = []
+
+    for index, row in df.iterrows():
+        excel_row = index + 2
+
+        phone = clean_phone(row.get("phone_number"))
+        list_id = clean_phone(row.get("list_id"))
+
+        if not phone or not list_id:
+            skipped.append({
+                "row": excel_row,
+                "reason": "Phone number or list_id missing"
+            })
+            continue
+
+        if not phone.isdigit():
+            skipped.append({
+                "row": excel_row,
+                "phone": phone,
+                "reason": "Invalid phone number"
+            })
+            continue
+
+        if phone in existing_phones:
+            skipped.append({
+                "row": excel_row,
+                "phone": phone,
+                "reason": "Duplicate phone"
+            })
+            continue
+
+        params = {
+            "source": SOURCE,
+            "user": vici_user,
+            "pass": Vici_pass,
+            "function": "add_lead",
+            "phone_number": phone,
+            "phone_code": "1",
+            "list_id": list_id,
+            "first_name": str(row.get("first_name", "")).strip(),
+            "last_name": str(row.get("last_name", "")).strip(),
+            "campaign_id": str(row.get("campaign_id", "")).strip()
+        }
+
+        try:
+            response = requests.get(vicidial_url, params=params, timeout=10)
+
+            if "SUCCESS" in response.text.upper():
+                success += 1
+                existing_phones.add(phone)
+            else:
+                failed.append({
+                    "row": excel_row,
+                    "phone": phone,
+                    "error": response.text
+                })
+
+        except Exception as e:
+            failed.append({
+                "row": excel_row,
+                "phone": phone,
+                "error": str(e)
+            })
+
+    return {
+        "total_rows": len(df),
+        "success": success,
+        "failed": len(failed),
+        "skipped": len(skipped),
+        "failed_details": failed,
+        "skipped_details": skipped
+    }
+
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    to_encode.update({
+        "exp": datetime.utcnow() + timedelta(minutes=60)
+    })
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+
+#Login
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/login")
+def login(data: LoginRequest):
+    try:
+        db = mysql.connector.connect(**DB_CONFIG)
+        cursor = db.cursor()
+        query = """
+            SELECT user, full_name, active
+            FROM vicidial_users
+            WHERE user=%s AND pass=%s
+            LIMIT 1
+        """
+
+        cursor.execute(query, (data.username, data.password))
+        user = cursor.fetchone()
+        print(user,"-----------------150")
+
+        userRec = {
+            "username": user[0],
+            "fullName": user[1],
+            "activeStatus": user[2]
+        }
+        print(userRec)
+
+        cursor.close()
+        db.close()
+
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+
+        if user[2] != "Y":
+            raise HTTPException(status_code=403, detail="User is inactive")
+        
+        access_token = create_access_token(
+            data={"sub": user[0]}   # MUST BE "sub"
+        )
+
+        return {
+            "status": "success",
+            "user": user[0],
+            "full_name": user[1],
+            "access_token": access_token,
+            "token_type": "bearer"
+        }
+    except Exception as e:
+        print("ERROR:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+# Callinggggggggggg
+VICIDIAL_API_URL = "http://192.168.15.177:8068/agc/api.php"
+
+API_USER = "AdminR"
+API_PASS = "AdminR"
+AGENT_USER = "8015"
+
+
+@app.post("/call")
+def call_number(phone: str, current_user: str = Depends(get_current_user)):
+    """
+    Initiates an outbound call from VICIdial agent
+    """
+    # print(current_user, "TTTTTTTTTTTTTTTTTTTTTT")
+    params = {
+        "source": "crm",
+        "user": API_USER,
+        "pass": API_PASS,
+        "agent_user":current_user,
+        "function": "external_dial",
+        "phone_code": "1",      # change country code if needed
+        "value": phone,
+        "preview": "NO",
+        "search": "YES",
+        "focus": "YES"
+    }
+
+    try:
+        response = requests.get(
+            VICIDIAL_API_URL,
+            params=params,
+            timeout=10
+        )
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {
+        "status": "success",
+        "vicidial_response": response.text
+    }
+
+
+
+#Hangup
+@app.post("/hangup")
+def hangup_call(current_user: str = Depends(get_current_user)):
+    params = {
+        "source": "crm",
+        "user": API_USER,
+        "pass": API_PASS,
+        "function": "external_pause",
+        "agent_user": current_user,
+        "value": "PAUSE"
+    }
+
+    res = requests.get(VICIDIAL_API_URL, params=params, timeout=10)
+
+    if "SUCCESS" not in res.text:
+        raise HTTPException(status_code=400, detail=res.text)
+
+    return {
+        "status": "success",
+        "agent_user": current_user,
+        "vicidial_response": res.text
+    }
+
+
+#vicidial_logData
+
+@app.post("/logdata")
+def login(request: Request):
+    try:
+        user = request.query_params.get("user")  
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+        
+        query = """
+            SELECT * FROM vicidial_agent_log WHERE user=%s order by event_time desc limit 1;
+        """
+        params = (user,)
+
+        cursor.execute(query, params)
+        data = cursor.fetchall()
+
+        cursor.close()
+        conn.close()
+
+        return {
+            "count": len(data),
+            "leads": data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

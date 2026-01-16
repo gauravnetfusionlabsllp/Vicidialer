@@ -1,0 +1,75 @@
+use asterisk
+#active users,campaigns,lists
+select * from vicidial_users where active='Y'
+select * from vicidial_campaigns where actve='Y'
+select * from vicidial_lists where active='Y'
+select * from vicidial_user_groups
+select * from vicidial_inbound_dids where did_active='Y'
+
+#inactive Users 
+select * from vicidial_users where active='N'
+select * from vicidial_campaigns where actve='N'
+select * from vicidial_lists where active='N'
+select * from vicidial_inbound_dids where did_active='N'
+
+#Total Users 
+select * from vicidial_users
+
+
+#cureent active Agents
+SELECT user,campaign_id,status,last_call_time,calls_today
+FROM vicidial_live_agents WHERE status != 'LOGGED_OUT' ORDER BY campaign_id, user;
+
+#Agents Call in Progress
+SELECT  vla.user,vla.uniqueid,vl.phone_number,vla.status,vla.last_call_time
+FROM vicidial_live_agents vla
+JOIN vicidial_log vl
+    ON vla.uniqueid = vl.uniqueid
+WHERE vla.status = 'INCALL';
+
+
+#Agents Call Count Today 
+SELECT  vla.user, vla.uniqueid,vl.phone_number,vla.status,vla.last_call_time
+FROM vicidial_live_agents vla
+JOIN vicidial_log vl
+    ON vla.uniqueid = vl.uniqueid
+WHERE vla.status = 'INCALL';
+
+#Numbers of calls by campaign Today
+SELECT campaign_id,COUNT(*) AS calls_today,SUM(IF(status = 'ANSWER', 1, 0)) AS answered,SUM(IF(status NOT IN ('ANSWER','DROP'), 1, 0)) AS other_status
+FROM vicidial_log
+WHERE call_date >= CURDATE()
+GROUP BY campaign_id;
+
+#Numbers of calls waiting in each campaign queue 
+SELECT  COUNT(*) AS waiting
+FROM vicidial_list
+WHERE status = 'QUEUE'
+
+#latest call Logs
+SELECT uniqueid,lead_id,user,status,call_date,length_in_sec
+FROM vicidial_log
+ORDER BY call_date DESC
+LIMIT 100;
+
+
+#Current active calls
+SELECT vla.user,vla.uniqueid,vl.phone_number,vla.status,vla.last_call_time
+FROM vicidial_live_agents AS vla JOIN vicidial_log AS vl ON vla.uniqueid = vl.uniqueid
+WHERE vla.status = 'INCALL';
+
+#current campaign dialing status
+SELECT campaign_id,COUNT(*) AS total_calls,
+    SUM(CASE WHEN status = 'ANSWER' THEN 1 ELSE 0 END) AS answered,
+    SUM(CASE WHEN status = 'DROP' THEN 1 ELSE 0 END) AS dropped
+FROM vicidial_log
+WHERE call_date >= CURDATE()
+GROUP BY campaign_id;
+
+#Calls waiting for thr agent
+SELECT campaign_id,COUNT(*) AS calls_waiting
+FROM vicidial_auto_calls
+WHERE status = 'LIVE' AND call_type = 'IN'
+GROUP BY campaign_id;
+
+
