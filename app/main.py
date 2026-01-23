@@ -325,6 +325,7 @@ def get_totaldials(request:Request, current_user: str = Depends(get_current_user
         # data = request.json()
         # sd = data.get('sd')
         # ed = data.get('ed')
+
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
         today_start = date.today()
@@ -340,7 +341,6 @@ def get_totaldials(request:Request, current_user: str = Depends(get_current_user
                     FROM vicidial_log v 
                     where date(v.call_date) = %s GROUP BY DATE(v.call_date) ;
                     """
-        print(current_user)
         cursor.execute(query,(today_start,today_start,today_start,today_start,today_start,))
         result = cursor.fetchall()
         for row in result:
@@ -1153,10 +1153,10 @@ def call_number(phone: Optional[str] = None,current_user: str = Depends(get_curr
                         LEFT JOIN vicidial_live_agents vla
                             ON vl.lead_id = vla.lead_id
                         WHERE vc.status = 'ACTIVE'
-                        AND DATE(vc.callback_time) = %s
+                        AND DATE(vc.callback_time) >= %s
                         AND vla.lead_id IS NULL
-                        AND vl.status NOT IN ('INCALL'))a   where  a.status  in ('NEW','CBHOLD') and a.first_name in ('ABCD','Adi','Ganesh','Vivek','Jash','Brijesh','Gaurav')  order by a.lead_id  limit 1
-                         , a.callback_time asc
+                        AND vl.status NOT IN ('INCALL'))a   where  a.status  in ('NEW','CBHOLD') and a.first_name in ('ABCD','Adi','Ganesh','Vivek','Jash','Brijesh','Gaurav')  order by a.lead_id  
+                          limit 1
                                     """
         params = (today_start,)
         cursor.execute(query,params,)
