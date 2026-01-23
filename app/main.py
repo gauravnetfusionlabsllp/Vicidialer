@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException,Query, Request,UploadFile,File,Depends,status
+from fastapi import FastAPI, HTTPException,Query, Request,UploadFile,File,Depends,status,APIRouter, Depends
 from jose import JWTError, jwt
 import mysql.connector
 from mysql.connector import Error
@@ -12,6 +12,8 @@ import time
 import requests
 import pandas as pd
 import io 
+from fastapi.encoders import jsonable_encoder
+from typing import Optional
 
 SECRET_KEY = "41b2ae40f9299813102265496f77665b12163f2386d4fc3ec7a8bcfa4ec56931"
 ALGORITHM = "HS256"
@@ -273,7 +275,7 @@ def get_all_data():
         raise HTTPException(status_code=500, detail=str(e))
  
 @app.get('/getcallbystatus')
-def get_calls_by_status():
+def get_calls_by_status( current_user: str = Depends(get_current_user)):
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
@@ -318,12 +320,11 @@ def seconds_to_hhmmss(seconds):
 
 #Total Dials Today
 @app.get('/totaldialstoday')
-def get_totaldials(request:Request):
+def get_totaldials(request:Request, current_user: str = Depends(get_current_user)):
     try:
         # data = request.json()
         # sd = data.get('sd')
         # ed = data.get('ed')
-
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
         today_start = date.today()
@@ -339,6 +340,7 @@ def get_totaldials(request:Request):
                     FROM vicidial_log v 
                     where date(v.call_date) = %s GROUP BY DATE(v.call_date) ;
                     """
+        print(current_user)
         cursor.execute(query,(today_start,today_start,today_start,today_start,today_start,))
         result = cursor.fetchall()
         for row in result:
@@ -351,7 +353,7 @@ def get_totaldials(request:Request):
 
 #Dialer Performance 
 @app.get('/dialerperformance')
-def get_dialerperformance():
+def get_dialerperformance(current_user: str = Depends(get_current_user)):
     try:    
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
@@ -383,7 +385,7 @@ def get_dialerperformance():
 
 #Agent Productivity
 @app.get('/agentsproductivity')
-def get_agentsproductivity():
+def get_agentsproductivity( current_user: str = Depends(get_current_user)):
     try:    
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
@@ -432,7 +434,7 @@ def get_agentsproductivity():
 
 #Agent Productivity
 @app.get('/campaignperformance')
-def get_campaignperformance():
+def get_campaignperformance(current_user: str = Depends(get_current_user)):
     try:    
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
@@ -469,7 +471,7 @@ def get_campaignperformance():
 
 #Compliance Review
 @app.get('/compliancereview')
-def get_compliancereview():
+def get_compliancereview( current_user: str = Depends(get_current_user)):
     try:    
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
@@ -498,7 +500,7 @@ def get_compliancereview():
 
 #Lead Funnel
 @app.get('/leadfunnel')
-def get_LeadFunnel(request:Request):
+def get_LeadFunnel(request:Request, current_user: str = Depends(get_current_user)):
     try:
         sd = request.query_params.get("sd")
         ed = request.query_params.get("ed")
@@ -558,7 +560,7 @@ def get_LeadFunnel(request:Request):
 
 #Hourly Performance 
 @app.get('/hourlyperformance')
-def get_LeadFunnel():
+def get_LeadFunnel( current_user: str = Depends(get_current_user)):
     try:    
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
@@ -594,7 +596,7 @@ def get_LeadFunnel():
 
 #Past Data For Graphs
 @app.get('/graphdata')
-def get_GraphData():
+def get_GraphData( current_user: str = Depends(get_current_user)):
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
@@ -650,7 +652,7 @@ def resolve_date_range(sd=None, ed=None):
     return start_date, end_date
 
 @app.get('/totaldialstodaydata')
-def get_totaldialsdata(request: Request):
+def get_totaldialsdata(request: Request, current_user: str = Depends(get_current_user)):
     try:
         sd = request.query_params.get("sd")
         ed = request.query_params.get("ed")
@@ -690,7 +692,7 @@ def get_totaldialsdata(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get('/leadfunnelwithdate')
-def get_LeadFunnel(request: Request):
+def get_LeadFunnel(request: Request, current_user: str = Depends(get_current_user)):
     try:
         sd = request.query_params.get("sd")
         ed = request.query_params.get("ed")
@@ -778,8 +780,12 @@ def load_existing_phones():
     conn = mysql.connector.connect(**DB_CONFIG)
     cursor = conn.cursor()
 
-    cursor.execute("SELECT phone_number FROM vicidial_list")
-    phones = {normalize_phone(row[0]) for row in cursor.fetchall()}
+    cursor.execute("SELECT distinct phone_number FROM vicidial_list  WHERE phone_number IS NOT NULL")
+    phones = set()
+    for (phone,) in cursor.fetchall():
+        cleaned = clean_phone(phone)
+        if cleaned:
+            phones.add(cleaned)
 
     cursor.close()
     conn.close()
@@ -935,6 +941,12 @@ def clean_phone(value):
     if value is None or value == "":
         return ""
 
+    value = str(value).strip()
+    if "E" in value.upper():
+        try:
+            value = "{:.0f}".format(float(value))
+        except:
+            return ""
     if isinstance(value, (int, float)):
         value = str(int(value))
 
@@ -942,7 +954,7 @@ def clean_phone(value):
 
     if value.endswith(".0"):
         value = value[:-2]
-
+    value = value.replace(" ", "")
     return value
 
 #upload_excel_leads
@@ -954,7 +966,8 @@ def upload_excel_leads(file: UploadFile = File(...),  current_user: str = Depend
 
     try:
         contents = file.file.read()
-        df = pd.read_excel(io.BytesIO(contents))
+        df = pd.read_excel(io.BytesIO(contents), dtype=str)
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid excel file: {e}")
 
@@ -975,6 +988,8 @@ def upload_excel_leads(file: UploadFile = File(...),  current_user: str = Depend
         )
 
     existing_phones = load_existing_phones()
+    # print("DB phones sample:", list(existing_phones))
+    print("Total DB phones:", len(existing_phones))
 
     success = 0
     failed = []
@@ -1073,7 +1088,7 @@ def login(data: LoginRequest):
         db = mysql.connector.connect(**DB_CONFIG)
         cursor = db.cursor()
         query = """
-            SELECT user, full_name, active
+            SELECT user, full_name, active, user_level
             FROM vicidial_users
             WHERE user=%s AND pass=%s
             LIMIT 1
@@ -1082,13 +1097,6 @@ def login(data: LoginRequest):
         cursor.execute(query, (data.username, data.password))
         user = cursor.fetchone()
         print(user,"-----------------150")
-
-        userRec = {
-            "username": user[0],
-            "fullName": user[1],
-            "activeStatus": user[2]
-        }
-        print(userRec)
 
         cursor.close()
         db.close()
@@ -1108,6 +1116,7 @@ def login(data: LoginRequest):
             "user": user[0],
             "full_name": user[1],
             "access_token": access_token,
+            "isAdmin": user[3] == 9,
             "token_type": "bearer"
         }
     except Exception as e:
@@ -1124,18 +1133,50 @@ AGENT_USER = "8015"
 
 
 @app.post("/call")
-def call_number(phone: str, current_user: str = Depends(get_current_user)):
-    """
-    Initiates an outbound call from VICIdial agent
-    """
-    # print(current_user, "TTTTTTTTTTTTTTTTTTTTTT")
+def call_number(phone: Optional[str] = None,current_user: str = Depends(get_current_user)):
+    userDetails = None
+
+    if not phone:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+        today_start = date.today()
+        query = """
+                
+                    select * from (
+                    select DISTINCT vl.phone_number, vl.lead_id, vl.first_name, vl.last_name, vl.status,""callback_time,""comments
+                    FROM vicidial_list vl where vl.lead_id  not in (select distinct lead_id from vicidial_log) and vl.status in ('NEW')
+                    union all 
+                    SELECT DISTINCT vl.phone_number, vl.lead_id, vl.first_name, vl.last_name, vl.status,vc.callback_time,vc.comments  
+                        FROM vicidial_callbacks vc
+                        INNER JOIN vicidial_list vl
+                                ON vc.lead_id = vl.lead_id
+                        LEFT JOIN vicidial_live_agents vla
+                            ON vl.lead_id = vla.lead_id
+                        WHERE vc.status = 'ACTIVE'
+                        AND DATE(vc.callback_time) = %s
+                        AND vla.lead_id IS NULL
+                        AND vl.status NOT IN ('INCALL'))a   where  a.status  in ('NEW','CBHOLD') and a.first_name in ('ABCD','Adi','Ganesh','Vivek','Jash','Brijesh','Gaurav')  order by a.lead_id  limit 1
+                         , a.callback_time asc
+                                    """
+        params = (today_start,)
+        cursor.execute(query,params,)
+        userDetails = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+
+        if not userDetails:
+            raise HTTPException(404, "No callable leads found")
+
+        phone = userDetails["phone_number"]
+
     params = {
         "source": "crm",
         "user": API_USER,
         "pass": API_PASS,
-        "agent_user":current_user,
+        "agent_user": current_user,
         "function": "external_dial",
-        "phone_code": "1",      # change country code if needed
+        "phone_code": "1",
         "value": phone,
         "preview": "NO",
         "search": "YES",
@@ -1143,37 +1184,92 @@ def call_number(phone: str, current_user: str = Depends(get_current_user)):
     }
 
     try:
-        response = requests.get(
-            VICIDIAL_API_URL,
-            params=params,
-            timeout=10
-        )
+        response = requests.get(VICIDIAL_API_URL, params=params, timeout=10)
     except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
 
     return {
         "status": "success",
-        "vicidial_response": response.text
+        "dialed_phone": phone,
+        "vicidial_response": response.text,
+        "details": jsonable_encoder(userDetails)
     }
 
+def unPauseUser(current_user):
+    res = requests.get(
+        VICIDIAL_API_URL,
+        params={
+            "source": "ctestrm",
+            "user": API_USER,
+            "pass": API_PASS,
+            "agent_user": current_user,
+            "function": "external_pause",
+            "value": "PAUSE"
+        },
+        timeout=10
+    )
+    return res.text
 
 
 #Hangup
+# Hangup (fallback-safe)
+# @app.post("/hangup")
+# def hangup_call(current_user: str = Depends(get_current_user)):
+
+#     # 1️⃣ Lock the call first
+#     requests.get(
+#         VICIDIAL_API_URL,
+#         params={
+#             "source": "crm",
+#             "user": API_USER,
+#             "pass": API_PASS,
+#             "agent_user": current_user,
+#             "function": "external_status",
+#             "value": "A"
+#         },
+#         timeout=10
+#     )
+
+#     time.sleep(1)
+
+#     # 2️⃣ Hangup both legs
+#     params = {
+#         "source": "crm",
+#         "user": API_USER,
+#         "pass": API_PASS,
+#         "function": "external_hangup",
+#         "agent_user": current_user,
+#         "value": "YES"
+#     }
+
+#     res = requests.get(VICIDIAL_API_URL, params=params, timeout=10)
+
+#     if "SUCCESS" not in res.text:
+#         raise HTTPException(status_code=400, detail=res.text)
+
+#     return {
+#         "status": "success",
+#         "agent_user": current_user,
+#         "vicidial_response": res.text
+#     }
+
+#hangup 
 @app.post("/hangup")
 def hangup_call(current_user: str = Depends(get_current_user)):
+
     params = {
         "source": "crm",
         "user": API_USER,
         "pass": API_PASS,
-        "function": "external_pause",
+        "function": "external_hangup",
         "agent_user": current_user,
-        "value": "PAUSE"
+        "value": 1
     }
-
     res = requests.get(VICIDIAL_API_URL, params=params, timeout=10)
 
     if "SUCCESS" not in res.text:
         raise HTTPException(status_code=400, detail=res.text)
+    # unPauseUser(current_user)
 
     return {
         "status": "success",
@@ -1182,7 +1278,7 @@ def hangup_call(current_user: str = Depends(get_current_user)):
     }
 
 
-#vicidial_logData
+#vicidial_logData for status 
 
 @app.post("/logdata")
 def login(request: Request):
@@ -1208,3 +1304,121 @@ def login(request: Request):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+#Status  
+@app.post("/vicidial-agent")
+def vicidial_agent_action(
+    status: str,
+    callback_datetime: str = None,
+    callback_comments: str = None,
+    current_user: str = Depends(get_current_user)
+):
+    responses = {}
+
+    # 1️⃣ Build external_status params
+    status_params = {
+        "source": "crm",
+        "user": API_USER,
+        "pass": API_PASS,
+        "agent_user": current_user,
+        "function": "external_status",
+        "value": status
+    }
+
+    if status == "CBR":
+        if not callback_datetime:
+            raise HTTPException(
+                400,
+                "callback_datetime and callback_comments required for CALLBK"
+            )
+
+        status_params.update({
+            "callback_datetime": callback_datetime,
+            "callback_type": "USERONLY",
+            "callback_comments": callback_comments
+        })
+
+    # 2️⃣ Disposition
+    status_resp = requests.get(
+        VICIDIAL_API_URL,
+        params=status_params,
+        timeout=10
+    )
+    responses["status"] = status_resp.text
+
+    if "SUCCESS" not in status_resp.text:
+        raise HTTPException(400, status_resp.text)
+
+    # 3️⃣ Hangup
+    hangup_resp = requests.get(
+        VICIDIAL_API_URL,
+        params={
+            "source": "crm",
+            "user": API_USER,
+            "pass": API_PASS,
+            "agent_user": current_user,
+            "function": "external_hangup",
+            "value": 1
+        },
+        timeout=10
+    )
+    responses["hangup"] = hangup_resp.text
+
+    # 4️⃣ Pause
+    time.sleep(5)
+    pause_resp = requests.get(
+        VICIDIAL_API_URL,
+        params={
+            "source": "crm",
+            "user": API_USER,
+            "pass": API_PASS,
+            "agent_user": current_user,
+            "function": "external_pause",
+            "value": "PAUSE"
+        },
+        timeout=10
+    )
+    responses["pause"] = pause_resp.text
+
+    return {
+        "success": True,
+        "agent": current_user,
+        "vicidial_responses": responses
+    }
+
+#Client data for Agents
+@app.post("/clients_for_agent")
+def call_number(current_user: str = Depends(get_current_user)):
+  
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor(dictionary=True)
+    today_start = date.today()
+    query = """
+                
+                    select * from   (    
+                    select vl.title,vl.first_name, vl.last_name,vl.city,vl.country_code,date(vl.entry_date)entry_date,vl.date_of_birth,vl.list_id,NULL callback_time,NULL comments,vl.lead_id,vl.status
+                    FROM vicidial_list vl where vl.lead_id  not in (select distinct lead_id from vicidial_log) and vl.status in ('NEW')
+                    union 
+                    SELECT DISTINCT vl.title,vl.first_name, vl.last_name,vl.city,vl.country_code,date(vl.entry_date)entry_date,vl.date_of_birth,vl.list_id,vc.callback_time,vc.comments,vl.lead_id,vl.status  
+                        FROM vicidial_callbacks vc
+                        INNER JOIN vicidial_list vl
+                                ON vc.lead_id = vl.lead_id
+                        LEFT JOIN vicidial_live_agents vla
+                            ON vl.lead_id = vla.lead_id
+                        WHERE vc.status = 'ACTIVE'
+                        AND DATE(vc.callback_time) = %s
+                        AND vla.lead_id IS NULL
+                        AND vl.status NOT IN ('INCALL'))a where a.status  in ('NEW','CBHOLD') and  a.first_name in ('ABCD','Adi','Ganesh','Vivek','Jash','Brijesh','Gaurav')  order by a.lead_id  asc
+                """
+    params = (today_start,)
+    cursor.execute(query,params)
+    data = cursor.fetchall() 
+
+    cursor.close()
+    conn.close()
+
+    return {
+        "status": "success",
+        "total_records": len(data),
+        "data": data
+    }
