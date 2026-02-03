@@ -1,12 +1,13 @@
-from fastapi import FastAPI, HTTPException,Query, Request,UploadFile,File,Depends,status,APIRouter, Depends
+from fastapi import FastAPI, Form, HTTPException,Query, Request,UploadFile,File,Depends,status,APIRouter, Depends
 from jose import JWTError, jwt
 import mysql.connector
 from mysql.connector import Error
 from datetime import datetime,date,timedelta
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from pydantic import BaseModel
+from psycopg2.extras import RealDictCursor
 import pymysql
 import time
 import requests
@@ -14,10 +15,11 @@ import pandas as pd
 import io 
 from fastapi.encoders import jsonable_encoder
 from typing import Optional
+from psycopg2 import pool
 
 SECRET_KEY = "41b2ae40f9299813102265496f77665b12163f2386d4fc3ec7a8bcfa4ec56931"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
@@ -25,7 +27,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 app = FastAPI()
 
 DB_CONFIG = {
-    "host": "192.168.15.177",
+    "host": "192.168.15.165",
     "user": "cron",
     "password": "1234",
     "database": "asterisk"
@@ -48,11 +50,20 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
+        is_admin = payload.get("isAdmin", False)
+        campaign_name = payload.get("campaign_name")
+        campaign_id = payload.get("campaign_id")
 
         if username is None:
             raise HTTPException(status_code=401, detail="Invalid token")
 
-        return username
+        return {
+            "username": username,
+            "isAdmin": is_admin,
+            "campaign_name":campaign_name,
+            "campaign_id":campaign_id
+
+        }
 
     except JWTError:
         raise HTTPException(
@@ -320,28 +331,37 @@ def seconds_to_hhmmss(seconds):
 
 #Total Dials Today
 @app.get('/totaldialstoday')
-def get_totaldials(request:Request, current_user: str = Depends(get_current_user)):
+def get_totaldials(request:Request, current_user: dict = Depends(get_current_user)):
     try:
-        # data = request.json()
-        # sd = data.get('sd')
-        # ed = data.get('ed')
-
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
         today_start = date.today()
-        query  = """ SELECT
+
+        print("cuerrrrr --- ", current_user)
+
+        user_id = current_user["username"]
+        is_admin = current_user["isAdmin"]
+        campaign_id = current_user["campaign_id"]
+        campaign_name = current_user["campaign_name"]
+
+        userfitler = f" and v.user='{user_id}' and v.campaign_id='{campaign_id}' " if not is_admin else ""
+ 
+        query  = f""" SELECT
                         DATE(v.call_date) AS call_date,
-                        (select count(*)Total_calls from vicidial_log where date(call_date) = %s) AS total_dials,
-                        (select count(*) from vicidial_log where date(call_date) =%s  and length_in_sec > 0) AS connected_calls,
+                        (select count(*)Total_calls from vicidial_log v where date(call_date) = %s {userfitler}) AS total_dials,
+                        (select count(*) from vicidial_log v where date(call_date) =%s  and length_in_sec > 0 {userfitler}) AS connected_calls,
                         ROUND((SUM(v.length_in_sec > 0) / COUNT(*)) * 100, 2 )  AS connection_rate_pct,
-                        (SELECT SUM(length_in_sec) FROM vicidial_log  WHERE DATE(call_date)= %s) AS total_talk_time,
-                        (select AVG(length_in_sec) from vicidial_log where date(call_date)= %s and length_in_sec >0 ) AS avg_talk_time_sec,
+                        (SELECT SUM(length_in_sec) FROM vicidial_log v  WHERE DATE(call_date)= %s {userfitler}) AS total_talk_time,
+                        (select AVG(length_in_sec) from vicidial_log v where date(call_date)= %s and length_in_sec >0 {userfitler} ) AS avg_talk_time_sec,
                         COUNT(distinct v.lead_id) AS leads_connected,
                         SUM(length_in_sec) AS total_seconds
                     FROM vicidial_log v 
-                    where date(v.call_date) = %s GROUP BY DATE(v.call_date) ;
+                    where date(v.call_date) = %s {userfitler} GROUP BY DATE(v.call_date) ;
                     """
+ 
         cursor.execute(query,(today_start,today_start,today_start,today_start,today_start,))
+     
+
         result = cursor.fetchall()
         for row in result:
             row["total_talk_time"] = seconds_to_hhmmss(row["total_talk_time"])
@@ -349,6 +369,7 @@ def get_totaldials(request:Request, current_user: str = Depends(get_current_user
         conn.close()
         return {"data":result}
     except Error as e:
+        print(e)
         raise HTTPException(status_code=500,detail=str(e))
 
 #Dialer Performance 
@@ -651,45 +672,46 @@ def resolve_date_range(sd=None, ed=None):
 
     return start_date, end_date
 
-@app.get('/totaldialstodaydata')
-def get_totaldialsdata(request: Request, current_user: str = Depends(get_current_user)):
-    try:
-        sd = request.query_params.get("sd")
-        ed = request.query_params.get("ed")
+# @app.get('/totaldialstodaydata')
+# def get_totaldialsdata(request: Request, current_user: str = Depends(get_current_user)):
+#     try:
+#         sd = request.query_params.get("sd")
+#         ed = request.query_params.get("ed")
 
-        start_date, end_date = resolve_date_range(sd, ed)
+#         start_date, end_date = resolve_date_range(sd, ed)
 
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor(dictionary=True)
+#         conn = mysql.connector.connect(**DB_CONFIG)
+#         cursor = conn.cursor(dictionary=True)
 
-        query = """ SELECT
-                        DATE(d.call_date) AS call_date,
-                        (select count(*)Total_calls from vicidial_log where date(call_date) BETWEEN %s AND %s) AS total_dials,
-                        (select count(*) from vicidial_log where date(call_date) BETWEEN %s AND %s  and length_in_sec > 0) AS connected_calls,
-                        ROUND((SUM(v.length_in_sec > 0) / COUNT(*)) * 100, 2 )  AS connection_rate_pct,
-                        (SELECT SUM(length_in_sec) FROM vicidial_log  WHERE DATE(call_date)BETWEEN %s AND %s) AS total_talk_time,
-                        AVG(v.length_in_sec) AS avg_talk_time_sec,
-                        COUNT(distinct v.lead_id) AS leads_connected,
-                        SUM(length_in_sec) AS total_seconds
-                    FROM vicidial_dial_log d
-                    LEFT JOIN vicidial_log v ON d.lead_id = v.lead_id AND d.call_date = v.call_date AND v.length_in_sec > 0
-                    where date(d.call_date) BETWEEN %s AND %s GROUP BY DATE(d.call_date) ;
+#         query = """ SELECT
+#                         DATE(d.call_date) AS call_date,
+#                         (select count(*)Total_calls from vicidial_log where date(call_date) BETWEEN %s AND %s) AS total_dials,
+#                         (select count(*) from vicidial_log where date(call_date) BETWEEN %s AND %s  and length_in_sec > 0) AS connected_calls,
+#                         ROUND((SUM(v.length_in_sec > 0) / COUNT(*)) * 100, 2 )  AS connection_rate_pct,
+#                         (SELECT SUM(length_in_sec) FROM vicidial_log  WHERE DATE(call_date)BETWEEN %s AND %s) AS total_talk_time,
+#                         AVG(v.length_in_sec) AS avg_talk_time_sec,
+#                         COUNT(distinct v.lead_id) AS leads_connected,
+#                         SUM(length_in_sec) AS total_seconds
+#                     FROM vicidial_dial_log d
+#                     LEFT JOIN vicidial_log v ON d.lead_id = v.lead_id AND d.call_date = v.call_date AND v.length_in_sec > 0
+#                     where date(d.call_date) BETWEEN %s AND %s GROUP BY DATE(d.call_date) ;
 
-        """
+#         """
 
-        cursor.execute(query, (start_date, end_date,start_date,end_date,start_date,end_date,start_date,end_date,))
-        result = cursor.fetchall()
 
-        for row in result:
-            row["total_talk_time"] = seconds_to_hhmmss(row["total_talk_time"])
+#         cursor.execute(query, (start_date, end_date,start_date,end_date,start_date,end_date,start_date,end_date,))
+#         result = cursor.fetchall()
 
-        cursor.close()
-        conn.close()
+#         for row in result:
+#             row["total_talk_time"] = seconds_to_hhmmss(row["total_talk_time"])
 
-        return {"data": result}
+#         cursor.close()
+#         conn.close()
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+#         return {"data": result}
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get('/leadfunnelwithdate')
 def get_LeadFunnel(request: Request, current_user: str = Depends(get_current_user)):
@@ -792,7 +814,7 @@ def load_existing_phones():
     return phones
 
 
-vicidial_url = "http://192.168.15.177:8068/vicidial/non_agent_api.php"
+vicidial_url = "http://192.168.15.165/vicidial/non_agent_api.php"
 
 vici_user = 'AdminR'
 Vici_pass = 'AdminR'
@@ -957,9 +979,36 @@ def clean_phone(value):
     value = value.replace(" ", "")
     return value
 
+#validate list with campaign 
+def validate_list_campaign(list_id, campaign_id):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+
+    query = """
+        SELECT 1
+        FROM vicidial_lists
+        WHERE list_id = %s
+          AND campaign_id = %s
+          AND active = 'Y'
+        LIMIT 1
+    """
+    cursor.execute(query, (list_id, campaign_id))
+    valid = cursor.fetchone() is not None
+
+    cursor.close()
+    conn.close()
+
+    return valid
+
 #upload_excel_leads
 @app.post("/upload_excel_leads")
-def upload_excel_leads(file: UploadFile = File(...),  current_user: str = Depends(get_current_user)):
+def upload_excel_leads(
+    campaign_id: str = Form(...),
+    campaign_name: str = Form(...),
+    
+    
+    file: UploadFile = File(...),  current_user: str = Depends(get_current_user)):
+   
 
     if not file.filename.endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Only .xlsx file allowed")
@@ -967,6 +1016,7 @@ def upload_excel_leads(file: UploadFile = File(...),  current_user: str = Depend
     try:
         contents = file.file.read()
         df = pd.read_excel(io.BytesIO(contents), dtype=str)
+        print(df)
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid excel file: {e}")
@@ -994,12 +1044,23 @@ def upload_excel_leads(file: UploadFile = File(...),  current_user: str = Depend
     success = 0
     failed = []
     skipped = []
+    not_valid =[]
 
     for index, row in df.iterrows():
         excel_row = index + 2
 
         phone = clean_phone(row.get("phone_number"))
-        list_id = clean_phone(row.get("list_id"))
+        list_id = str(row.get("list_id")).strip()
+        # ✅= VALIDATE list belongs to selected campaign
+        if not validate_list_campaign(list_id, campaign_id):
+            not_valid.append({
+                "row": excel_row,
+                "list_id": list_id,
+                "reason": f"List {list_id} does not belong to campaign {campaign_id}"
+            })
+            continue
+
+
 
         if not phone or not list_id:
             skipped.append({
@@ -1007,6 +1068,7 @@ def upload_excel_leads(file: UploadFile = File(...),  current_user: str = Depend
                 "reason": "Phone number or list_id missing"
             })
             continue
+        
 
         if not phone.isdigit():
             skipped.append({
@@ -1024,6 +1086,8 @@ def upload_excel_leads(file: UploadFile = File(...),  current_user: str = Depend
             })
             continue
 
+        
+
         params = {
             "source": SOURCE,
             "user": vici_user,
@@ -1034,7 +1098,7 @@ def upload_excel_leads(file: UploadFile = File(...),  current_user: str = Depend
             "list_id": list_id,
             "first_name": str(row.get("first_name", "")).strip(),
             "last_name": str(row.get("last_name", "")).strip(),
-            "campaign_id": str(row.get("campaign_id", "")).strip()
+            # "campaign_id": str(row.get("campaign_id", "")).strip(),
         }
 
         try:
@@ -1058,19 +1122,22 @@ def upload_excel_leads(file: UploadFile = File(...),  current_user: str = Depend
             })
 
     return {
+        "campaign_id": campaign_id,
+        "campaign_name": campaign_name,
         "total_rows": len(df),
         "success": success,
         "failed": len(failed),
         "skipped": len(skipped),
         "failed_details": failed,
-        "skipped_details": skipped
+        "skipped_details": skipped,
+        "list_and_campaign":not_valid
     }
 
 
 def create_access_token(data: dict):
     to_encode = data.copy()
     to_encode.update({
-        "exp": datetime.utcnow() + timedelta(minutes=60)
+        "exp": datetime.utcnow() + timedelta(minutes=1440)
     })
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -1080,26 +1147,44 @@ def create_access_token(data: dict):
 class LoginRequest(BaseModel):
     username: str
     password: str
-
+    campaign_id: str
+    campaign_name: str
+    role :str
 
 @app.post("/login")
 def login(data: LoginRequest):
     try:
         db = mysql.connector.connect(**DB_CONFIG)
         cursor = db.cursor()
-        query = """
-            SELECT user, full_name, active, user_level
-            FROM vicidial_users
-            WHERE user=%s AND pass=%s
-            LIMIT 1
-        """
+        if data.role == 'Agent':
+            query = """
+                SELECT vu.user, full_name,vu.active, user_level,vca.campaign_id, vc.campaign_name
+                FROM vicidial_users vu join vicidial_campaign_agents vca on vu.user=vca.user
+                left join vicidial_campaigns vc on vc.campaign_id =vca.campaign_id 
+                WHERE vu.user=%s AND pass=%s AND vca.campaign_id=%s AND vc.campaign_name=%s AND vc.Active='Y' AND vu.active='Y' and vu.user_level <> 9
+                LIMIT 1
+            """
 
-        cursor.execute(query, (data.username, data.password))
-        user = cursor.fetchone()
-        print(user,"-----------------150")
+            cursor.execute(query, (data.username, data.password,data.campaign_id,data.campaign_name))
+            user = cursor.fetchone()
+            print(user,"-----------------150")
 
-        cursor.close()
-        db.close()
+            cursor.close()
+            db.close()
+        else :
+            query = """
+                SELECT vu.user, full_name,vu.active, user_level
+                FROM vicidial_users vu 
+                WHERE vu.user=%s AND pass=%s  AND vu.active='Y' and vu.user_level <= 9
+                LIMIT 1
+            """
+
+            cursor.execute(query, (data.username, data.password,))
+            user = cursor.fetchone()
+            print(user,"-----------------150")
+
+            cursor.close()
+            db.close()
 
         if not user:
             raise HTTPException(status_code=401, detail="Invalid username or password")
@@ -1108,7 +1193,7 @@ def login(data: LoginRequest):
             raise HTTPException(status_code=403, detail="User is inactive")
         
         access_token = create_access_token(
-            data={"sub": user[0]}   # MUST BE "sub"
+            data={"sub": user[0],"isAdmin": user[3] == 9,"campaign_id": data.campaign_id,"campaign_name": data.campaign_name}   # MUST BE "sub"
         )
 
         return {
@@ -1117,6 +1202,8 @@ def login(data: LoginRequest):
             "full_name": user[1],
             "access_token": access_token,
             "isAdmin": user[3] == 9,
+            "campaign_id": data.campaign_id,
+            "campaign_name": data.campaign_name,
             "token_type": "bearer"
         }
     except Exception as e:
@@ -1125,12 +1212,41 @@ def login(data: LoginRequest):
     
 
 # Callinggggggggggg
-VICIDIAL_API_URL = "http://192.168.15.177:8068/agc/api.php"
+VICIDIAL_API_URL = "http://192.168.15.165/agc/api.php"
 
 API_USER = "AdminR"
 API_PASS = "AdminR"
 AGENT_USER = "8015"
 
+def pauseUser(current_user):
+    res = requests.get(
+        VICIDIAL_API_URL,
+        params={
+            "source": "ctestrm",
+            "user": API_USER,
+            "pass": API_PASS,
+            "agent_user": current_user["username"],
+            "function": "external_pause",
+            "value": "PAUSE"
+        },
+        timeout=10
+    )
+    return res.text
+
+def get_agent_status(username):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute(
+        "SELECT status FROM vicidial_live_agents WHERE user = %s",
+        (username,)
+    )
+    row = cursor.fetchone()
+
+    cursor.close()
+    conn.close()
+
+    return row["status"] if row else None
 
 @app.post("/call")
 def call_number(phone: Optional[str] = None,current_user: str = Depends(get_current_user)):
@@ -1140,28 +1256,22 @@ def call_number(phone: Optional[str] = None,current_user: str = Depends(get_curr
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
         today_start = date.today()
+        campaign_id = current_user["campaign_id"]
+        campaign_name = current_user["campaign_name"]
         query = """
                 
                     select * from (
                     select DISTINCT vl.phone_number, vl.lead_id, vl.first_name, vl.last_name, vl.status,""callback_time,""comments
-                    FROM vicidial_list vl where vl.lead_id  not in (select distinct lead_id from vicidial_log) and vl.status in ('NEW')
-                    union all 
-                    SELECT DISTINCT vl.phone_number, vl.lead_id, vl.first_name, vl.last_name, vl.status,vc.callback_time,vc.comments  
-                        FROM vicidial_callbacks vc
-                        INNER JOIN vicidial_list vl
-                                ON vc.lead_id = vl.lead_id
-                        LEFT JOIN vicidial_live_agents vla
-                            ON vl.lead_id = vla.lead_id
-                        WHERE vc.status = 'ACTIVE'
-                        AND DATE(vc.callback_time) >= %s
-                        AND vla.lead_id IS NULL
-                        AND vl.status NOT IN ('INCALL'))a   where  a.status  in ('NEW','CBHOLD') and a.first_name in ('ABCD','Adi','Ganesh','Vivek','Jash','Brijesh','Gaurav')  order by a.lead_id  
+                    FROM vicidial_list vl  
+                    INNER JOIN vicidial_lists vls ON vl.list_id =vls.list_id 
+                    where vl.lead_id  not in (select distinct lead_id from vicidial_log) and vl.status in ('NEW') AND vls.campaign_id =%s
+                    )a   where  a.status  in ('NEW') order by a.lead_id  
                           limit 1
                                     """
-        params = (today_start,)
+        params = (campaign_id,)
         cursor.execute(query,params,)
         userDetails = cursor.fetchone()
-
+        print(userDetails)
         cursor.close()
         conn.close()
 
@@ -1174,7 +1284,7 @@ def call_number(phone: Optional[str] = None,current_user: str = Depends(get_curr
         "source": "crm",
         "user": API_USER,
         "pass": API_PASS,
-        "agent_user": current_user,
+        "agent_user": current_user["username"],
         "function": "external_dial",
         "phone_code": "1",
         "value": phone,
@@ -1182,6 +1292,13 @@ def call_number(phone: Optional[str] = None,current_user: str = Depends(get_curr
         "search": "YES",
         "focus": "YES"
     }
+
+    agent_status = get_agent_status(current_user["username"])
+
+    if agent_status != "PAUSED":
+        pause_response = pauseUser(current_user)
+        time.sleep(2)  # allow VICIdial to update state
+
 
     try:
         response = requests.get(VICIDIAL_API_URL, params=params, timeout=10)
@@ -1194,22 +1311,6 @@ def call_number(phone: Optional[str] = None,current_user: str = Depends(get_curr
         "vicidial_response": response.text,
         "details": jsonable_encoder(userDetails)
     }
-
-def unPauseUser(current_user):
-    res = requests.get(
-        VICIDIAL_API_URL,
-        params={
-            "source": "ctestrm",
-            "user": API_USER,
-            "pass": API_PASS,
-            "agent_user": current_user,
-            "function": "external_pause",
-            "value": "PAUSE"
-        },
-        timeout=10
-    )
-    return res.text
-
 
 #Hangup
 # Hangup (fallback-safe)
@@ -1256,13 +1357,14 @@ def unPauseUser(current_user):
 #hangup 
 @app.post("/hangup")
 def hangup_call(current_user: str = Depends(get_current_user)):
+    user_id = current_user["username"]
 
     params = {
         "source": "crm",
         "user": API_USER,
         "pass": API_PASS,
         "function": "external_hangup",
-        "agent_user": current_user,
+        "agent_user": user_id,
         "value": 1
     }
     res = requests.get(VICIDIAL_API_URL, params=params, timeout=10)
@@ -1273,7 +1375,7 @@ def hangup_call(current_user: str = Depends(get_current_user)):
 
     return {
         "status": "success",
-        "agent_user": current_user,
+        "agent_user":  user_id,
         "vicidial_response": res.text
     }
 
@@ -1281,27 +1383,24 @@ def hangup_call(current_user: str = Depends(get_current_user)):
 #vicidial_logData for status 
 
 @app.post("/logdata")
-def login(request: Request):
+def login(request: Request, current_user: str = Depends(get_current_user)):
     try:
-        user = request.query_params.get("user")  
+        user = current_user["username"] 
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
         
         query = """
-            SELECT * FROM vicidial_agent_log WHERE user=%s order by event_time desc limit 1;
+            select count(*) as inCall from vicidial_live_agents where user = %s AND  lead_id in (select distinct Lead_id from vicidial_auto_calls);
         """
         params = (user,)
 
-        cursor.execute(query, params)
-        data = cursor.fetchall()
+        cursor.execute(query,params,)
+        data = cursor.fetchone()
 
         cursor.close()
         conn.close()
 
-        return {
-            "count": len(data),
-            "leads": data
-        }
+        return data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1320,7 +1419,7 @@ def vicidial_agent_action(
         "source": "crm",
         "user": API_USER,
         "pass": API_PASS,
-        "agent_user": current_user,
+        "agent_user": current_user["username"],
         "function": "external_status",
         "value": status
     }
@@ -1356,7 +1455,7 @@ def vicidial_agent_action(
             "source": "crm",
             "user": API_USER,
             "pass": API_PASS,
-            "agent_user": current_user,
+            "agent_user": current_user["username"],
             "function": "external_hangup",
             "value": 1
         },
@@ -1372,7 +1471,7 @@ def vicidial_agent_action(
             "source": "crm",
             "user": API_USER,
             "pass": API_PASS,
-            "agent_user": current_user,
+            "agent_user": current_user["username"],
             "function": "external_pause",
             "value": "PAUSE"
         },
@@ -1382,36 +1481,48 @@ def vicidial_agent_action(
 
     return {
         "success": True,
-        "agent": current_user,
+        "agent": current_user["username"],
         "vicidial_responses": responses
     }
 
-#Client data for Agents
+# Client data for Agents
 @app.post("/clients_for_agent")
-def call_number(current_user: str = Depends(get_current_user)):
+def call_number(callbackOnly: Optional[bool] = False,  current_user: str = Depends(get_current_user)):
   
     conn = mysql.connector.connect(**DB_CONFIG)
     cursor = conn.cursor(dictionary=True)
     today_start = date.today()
-    query = """
-                
-                    select * from   (    
-                    select vl.title,vl.first_name, vl.last_name,vl.city,vl.country_code,date(vl.entry_date)entry_date,vl.date_of_birth,vl.list_id,NULL callback_time,NULL comments,vl.lead_id,vl.status
-                    FROM vicidial_list vl where vl.lead_id  not in (select distinct lead_id from vicidial_log) and vl.status in ('NEW')
-                    union 
-                    SELECT DISTINCT vl.title,vl.first_name, vl.last_name,vl.city,vl.country_code,date(vl.entry_date)entry_date,vl.date_of_birth,vl.list_id,vc.callback_time,vc.comments,vl.lead_id,vl.status  
-                        FROM vicidial_callbacks vc
-                        INNER JOIN vicidial_list vl
-                                ON vc.lead_id = vl.lead_id
-                        LEFT JOIN vicidial_live_agents vla
-                            ON vl.lead_id = vla.lead_id
-                        WHERE vc.status = 'ACTIVE'
-                        AND DATE(vc.callback_time) = %s
-                        AND vla.lead_id IS NULL
-                        AND vl.status NOT IN ('INCALL'))a where a.status  in ('NEW','CBHOLD') and  a.first_name in ('ABCD','Adi','Ganesh','Vivek','Jash','Brijesh','Gaurav')  order by a.lead_id  asc
+    
+    user_id = current_user["username"]
+    campaign_id = current_user["campaign_id"]
+    campaign_name = current_user["campaign_name"]
+
+    if callbackOnly:
+        query = """ SELECT DISTINCT vl.phone_number,vl.title,vl.first_name, vl.last_name,vl.city,vl.country_code,date(vl.entry_date)entry_date,vl.date_of_birth,vl.list_id,vc.callback_time,
+                    vc.comments,vl.lead_id,vl.status,vls.campaign_id  
+                    FROM vicidial_callbacks vc
+                    INNER JOIN vicidial_list vl ON vc.lead_id = vl.lead_id
+                    INNER JOIN vicidial_lists vls ON vl.list_id=vls.list_id
+                    LEFT JOIN vicidial_live_agents vla  ON vl.lead_id = vla.lead_id
+                    WHERE vc.status in ('ACTIVE','LIVE') and vc.user=%s AND vc.callback_time >= now() 
+                    AND vla.lead_id IS NULL AND vls.campaign_id = %s
+                    AND vl.status  IN ('CBR','CBHOLD') 
+
                 """
-    params = (today_start,)
-    cursor.execute(query,params)
+        params=(user_id,campaign_id,)
+    else: 
+        query = """
+                select * from (
+                select distinct vl.title,vl.first_name, vl.last_name,vl.city,vl.country_code,date(vl.entry_date)entry_date,vl.date_of_birth,vl.list_id,NULL callback_time
+                ,NULL comments,vl.lead_id,vl.status,vls.campaign_id
+                FROM vicidial_list vl 
+                INNER JOIN vicidial_lists vls ON vl.list_id =vls.list_id
+                where vl.lead_id  not in (select distinct lead_id from vicidial_log) and vl.status in ('NEW') AND vls.campaign_id =%s
+                )a   where  a.status  in ('NEW') 
+                order by a.lead_id  
+                        """
+        params = (campaign_id,)
+    cursor.execute(query,params,)
     data = cursor.fetchall() 
 
     cursor.close()
@@ -1422,3 +1533,136 @@ def call_number(current_user: str = Depends(get_current_user)):
         "total_records": len(data),
         "data": data
     }
+
+
+
+pgsqlPool = pool.SimpleConnectionPool(
+    minconn=1,
+    maxconn=20,  
+    dbname="customDialer",
+    user="postgres",
+    password="Soft!@7890",
+    host="192.168.15.105"
+)
+
+BUFFER_SECONDS = 30
+@app.get("/ping")
+def ping(current_user: str = Depends(get_current_user)):
+    user_id = current_user["username"]
+    now = datetime.now()
+
+    conn = pgsqlPool.getconn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, first_tick, last_tick
+        FROM user_online_sessions
+        WHERE user_id = %s
+        ORDER BY last_tick DESC
+        LIMIT 1
+    """, (user_id,))
+
+    row = cur.fetchone()
+
+    if row:
+        session_id, first_tick, last_tick = row
+        if now.date() == last_tick.date() and now - last_tick <= timedelta(seconds=BUFFER_SECONDS):
+            cur.execute("""
+                UPDATE user_online_sessions
+                SET last_tick = %s
+                WHERE id = %s
+            """, (now, session_id))
+        else:
+            cur.execute("""
+                INSERT INTO user_online_sessions
+                (user_id, first_tick, last_tick)
+                VALUES (%s, %s, %s)
+            """, (user_id, now, now))
+    else:
+        cur.execute("""
+            INSERT INTO user_online_sessions
+            (user_id, first_tick, last_tick)
+            VALUES (%s, %s, %s)
+        """, (user_id, now, now))
+
+    conn.commit()
+    cur.close()
+    pgsqlPool.putconn(conn)
+    return {"status": "ok"}
+
+
+@app.get("/usertimeline")
+def ping(current_user: str = Depends(get_current_user)):
+    try:
+        user_id = current_user["username"]
+        conn = pgsqlPool.getconn()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        today_start = date.today()
+        
+        query = """
+            SELECT * FROM public.user_online_sessions where user_id=%s and date(first_tick)=CURRENT_DATE
+            and date(last_tick)=CURRENT_DATE 
+        """
+        params = (user_id,)
+        # params = (user_id,today_start,today_start,)
+
+        cursor.execute(query, params,)
+        data = cursor.fetchall()
+
+        cursor.close()
+        conn.close()
+
+        return {
+            "count": len(data),
+            "leads": data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+@app.get("/health/db")
+def check_db():
+    conn = None
+    try:
+        conn = pgsqlPool.getconn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        return {"db": "connected"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="DB not connected")
+    finally:
+        if conn:
+            pgsqlPool.putconn(conn)
+
+
+@app.get("/campaigns")
+def get_active_campaigns():
+    conn = None
+    cursor = None
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+
+        query = """
+        SELECT campaign_id, campaign_name, active
+        FROM vicidial_campaigns
+        WHERE active = 'Y'
+        """
+        cursor.execute(query)
+        campaigns = cursor.fetchall()
+
+        return {
+            "status": "success",
+            "count": len(campaigns),
+            "data": campaigns
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
