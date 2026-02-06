@@ -582,7 +582,6 @@ def get_LeadFunnel(request:Request, current_user: str = Depends(get_current_user
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
 #Hourly Performance 
 @app.get('/hourlyperformance')
 def get_LeadFunnel( current_user: str = Depends(get_current_user)):
