@@ -19,9 +19,14 @@ from psycopg2 import pool
 import asyncio
 from pydantic import BaseModel
 from typing import List
-import re
+import httpx
+from twilio.rest import Client
+import os
+from dotenv import load_dotenv
+load_dotenv()
+from urllib.parse import quote
 
-SECRET_KEY = "41b2ae40f9299813102265496f77665b12163f2386d4fc3ec7a8bcfa4ec56931"
+SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 
@@ -965,6 +970,9 @@ def get_leads(request: Request,  current_user: str = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+
+
 def clean_phone(value):
     if value is None or value == "":
         return ""
@@ -1092,13 +1100,13 @@ def upload_excel_leads(
             })
             continue
 
-        if phone in existing_phones:
-            skipped.append({
-                "row": excel_row,
-                "phone": phone,
-                "reason": "Duplicate phone"
-            })
-            continue
+        # if phone in existing_phones:
+        #     skipped.append({
+        #         "row": excel_row,
+        #         "phone": phone,
+        #         "reason": "Duplicate phone"
+        #     })
+        #     continue
 
         
 
@@ -1783,7 +1791,7 @@ def ping(current_user: str = Depends(get_current_user)):
         data = cursor.fetchall()
 
         cursor.close()
-        conn.close()
+        pgsqlPool.putconn(conn)
 
         return {
             "count": len(data),
@@ -1846,7 +1854,7 @@ class DeleteLeadRequest(BaseModel):
 def delet_lead(data: DeleteLeadRequest, current_user: str = Depends(get_current_user)):
     conn = mysql.connector.connect(**DB_CONFIG)
     cursor = conn.cursor(dictionary=True)
-    #r phone_number = request.query_params.get("phone_numbe") 
+    # phone_number = request.query_params.get("phone_numbe") 
     try : 
         
         
@@ -1862,11 +1870,11 @@ def delet_lead(data: DeleteLeadRequest, current_user: str = Depends(get_current_
         """
         cursor.execute(delete_leads_query, tuple(phone_list))
 
-        delete_logs_query = f"""
-            DELETE FROM vicidial_log
-            WHERE phone_number IN ({placeholders})
-        """
-        cursor.execute(delete_logs_query, tuple(phone_list))
+        # delete_logs_query = f"""
+        #     DELETE FROM vicidial_log
+        #     WHERE phone_number IN ({placeholders})
+        # """
+        # cursor.execute(delete_logs_query, tuple(phone_list))
 
         # delete_carrier_log_query = "DELETE FROM vicidial_carrier_log WHERE phone_number = %s"
         # cursor.execute(delete_carrier_log_query, (phone_number,))
@@ -1968,3 +1976,76 @@ def call_number(phone: Optional[str] = None):
         "vicidial_response": response.text,
         "details": jsonable_encoder(userDetails)
     }
+
+#for whatsapp 
+WHATSAPP_TOKEN = "your_meta_api_token"
+PHONE_NUMBER_ID = "your_office_number_id"
+
+@app.post("/send-whatsapp")
+async def send_whatsapp(client_number: str, message: str):
+    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": client_number,  # e.g. "919876543210"
+        "type": "text",
+        "text": {"body": message}
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload, headers=headers)
+    
+    return response.json()
+
+#for message 
+
+
+TWILIO_ACCOUNT_SID=os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN=os.getenv("TWILIO_AUTH_TOKEN")
+# TWILIO_PHONE_NUMBER='+18203007188'
+WHATSAPP_NUMBER=os.getenv("WHATSAPP_NUMBER") 
+PREFILLED_TEXT = quote("Hello! I'm interested in your services. Please contact me.")
+WHATSAPP_LINK=f"https://wa.me/{WHATSAPP_NUMBER}?text={PREFILLED_TEXT}"
+TWILIO_MESSAGING_SERVICE_SID =os.getenv("TWILIO_MESSAGING_SERVICE_SID") 
+# twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+class SMSRequest(BaseModel):
+    phone_number: str
+    custom_message: Optional[str] = None
+
+
+@app.post("/send-sms")
+def send_sms(data: SMSRequest):
+
+    phone_number = data.phone_number
+    message_body = (
+        data.custom_message
+        or f"Hello! Connect with us on WhatsApp: {WHATSAPP_LINK}"
+    )
+
+    try:
+        message = twilio_client.messages.create(
+            body=message_body,
+            messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID,
+            to=phone_number
+        )
+
+        return {
+            "success": True,
+            "message_sid": message.sid,
+            "status": message.status,
+            "to_phone_number": phone_number
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
