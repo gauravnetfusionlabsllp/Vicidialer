@@ -104,7 +104,7 @@ app = FastAPI(title="VICIdial Dashboard", version="7.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://192.168.15.104:5000", "http://localhost:5000","http://192.168.15.104:5500", "http://localhost:5500"],
+    allow_origins=["http://192.168.15.104:5000", "http://localhost:5000","http://192.168.15.104:5500", "http://localhost:5500","https://alphatrade.fortiddns.com/"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
