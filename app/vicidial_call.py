@@ -79,8 +79,8 @@ POSTGRES_DB = {
 # ─────────────────────────────────────────────
 # VICIDIAL API CONFIG
 # ─────────────────────────────────────────────
-vicidial_url     = "http://192.168.15.165/vicidial/non_agent_api.php"
-VICIDIAL_API_URL = "http://192.168.15.165/agc/api.php"
+vicidial_url     = "http://192.168.15.165:5165/vicidial/non_agent_api.php"
+VICIDIAL_API_URL = "http://192.168.15.165:5165/agc/api.php"
 API_USER         = "AdminR"
 API_PASS         = "AdminR"
 vici_user        = "AdminR"
@@ -513,7 +513,7 @@ def sync_recording_log(target_date: str = None) -> dict:
                 FROM recording_log
                 WHERE DATE(start_time) = %s
                   AND location IS NOT NULL
-                  AND location != ''
+                  AND location != '' and location not like '%.wav'
                 ORDER BY start_time DESC
             """, (target_date,))
             rows = cur.fetchall()
@@ -1423,7 +1423,7 @@ def get_agentsproductivity(request: Request, current_user: str = Depends(get_cur
                     SUM(CASE WHEN call_outcome = 'Not Converted'   THEN 1 ELSE 0 END) AS not_converted,
                     SUM(CASE WHEN call_outcome = 'Lead Generated'  THEN 1 ELSE 0 END) AS leads_generated
                 FROM call_analysis
-                WHERE status = 'success'
+                WHERE status in  ('success','successful')
                   AND DATE(start_time) BETWEEN %s AND %s
                 GROUP BY agent_user
             """, (sd, ed))
