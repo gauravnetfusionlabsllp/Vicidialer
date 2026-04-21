@@ -4,7 +4,7 @@
 # ═══════════════════════════════════════════════════════════════
 
 from fastapi import FastAPI, Form, HTTPException, Query, Request, UploadFile, File, Depends, status, APIRouter
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.encoders import jsonable_encoder
@@ -1956,3 +1956,241 @@ def send_sms(data: SMSRequest):
         return {"success": True, "message_sid": message.sid, "status": message.status, "to_phone_number": phone_number}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+
+# ═══════════════════════════════════════════════════════════════
+#  META / FACEBOOK LEAD WEBHOOK
+#  Add these env vars to your .env:
+#    VERIFY_TOKEN=your_verify_token
+#    PAGE_ACCESS_TOKEN=your_page_access_token
+#    META_DEFAULT_LIST_ID=your_vicidial_list_id
+#    META_DEFAULT_CAMPAIGN_ID=your_vicidial_campaign_id
+# ═══════════════════════════════════════════════════════════════
+
+VERIFY_TOKEN         = os.getenv("VERIFY_TOKEN")
+PAGE_ACCESS_TOKEN    = os.getenv("PAGE_ACCESS_TOKEN")
+META_DEFAULT_LIST_ID = os.getenv("META_DEFAULT_LIST_ID", "")
+META_DEFAULT_CAMP_ID = os.getenv("META_DEFAULT_CAMPAIGN_ID", "")
+
+
+# ─────────────────────────────────────────────
+# HELPER: fetch full lead from Graph API
+# ─────────────────────────────────────────────
+async def fetch_meta_lead(leadgen_id: str) -> dict:
+    url = f"https://graph.facebook.com/v19.0/{leadgen_id}"
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url, params={"access_token": PAGE_ACCESS_TOKEN})
+        res.raise_for_status()
+        return res.json()
+
+
+# ─────────────────────────────────────────────
+# HELPER: parse field_data list → flat dict
+# ─────────────────────────────────────────────
+def parse_lead_fields(field_data: list) -> dict:
+    """
+    Facebook returns: [{"name": "phone_number", "values": ["0501234567"]}, ...]
+    We flatten it to: {"phone_number": "0501234567", ...}
+    """
+    result = {}
+    for field in field_data:
+        key   = field.get("name", "").lower().replace(" ", "_")
+        vals  = field.get("values", [])
+        result[key] = vals[0] if vals else ""
+    return result
+
+
+# ─────────────────────────────────────────────
+# HELPER: push one lead into VICIdial
+# ─────────────────────────────────────────────
+def push_lead_to_vicidial(phone: str, first_name: str, last_name: str,
+                           email: str, list_id: str) -> dict:
+    params = {
+        "source":       SOURCE,
+        "user":         vici_user,
+        "pass":         Vici_pass,
+        "function":     "add_lead",
+        "phone_number": phone,
+        "phone_code":   "1",
+        "list_id":      7022026,
+        "first_name":   first_name,
+        "last_name":    last_name,
+        "email":        email,
+    }
+    try:
+        res = requests.get(vicidial_url, params=params, timeout=10)
+        success = "SUCCESS" in res.text.upper()
+        return {"success": success, "response": res.text}
+    except Exception as e:
+        return {"success": False, "response": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  WEBHOOK ROUTES
+# ═══════════════════════════════════════════════════════════════
+
+from fastapi.responses import PlainTextResponse, HTMLResponse
+
+# ── Webhook verification (Facebook handshake) ─────────────────
+@app.get("/webhook/facebook")
+def verify_facebook_webhook(
+    hub_mode:         str = Query(None, alias="hub.mode"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token"),
+    hub_challenge:    str = Query(None, alias="hub.challenge"),
+):
+    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
+        print("[Meta Webhook] Verified successfully")
+        return PlainTextResponse(content=hub_challenge, status_code=200)
+    print("[Meta Webhook] Verification FAILED")
+    return PlainTextResponse(content="Forbidden", status_code=403)
+
+
+# ── Receive lead events ────────────────────────────────────────
+@app.post("/webhook/facebook")
+async def receive_facebook_webhook(request: Request):
+    body = await request.json()
+    print("[Meta Webhook] Incoming:", json.dumps(body, indent=2))
+
+    results = []
+
+    try:
+        for entry in body.get("entry", []):
+            for change in entry.get("changes", []):
+                if change.get("field") != "leadgen":
+                    continue
+
+                leadgen_id  = change["value"].get("leadgen_id")
+                form_id     = change["value"].get("form_id", "")
+                page_id     = change["value"].get("page_id", "")
+
+                if not leadgen_id:
+                    continue
+
+                print(f"[Meta Webhook] New lead: leadgen_id={leadgen_id}")
+
+                # 1) Fetch full lead data from Graph API
+                try:
+                    lead_data  = await fetch_meta_lead(leadgen_id)
+                except Exception as e:
+                    print(f"[Meta Webhook] Failed to fetch lead {leadgen_id}: {e}")
+                    results.append({"leadgen_id": leadgen_id, "error": str(e)})
+                    continue
+
+                print(f"[Meta Webhook] Lead data: {json.dumps(lead_data, indent=2)}")
+
+                # 2) Parse fields
+                field_data  = lead_data.get("field_data", [])
+                fields      = parse_lead_fields(field_data)
+
+                phone       = clean_phone(
+                    fields.get("phone_number")
+                    or fields.get("phone")
+                    or fields.get("mobile_number")
+                    or ""
+                )
+                first_name  = fields.get("first_name", "").strip()
+                last_name   = fields.get("last_name",  "").strip()
+                full_name   = fields.get("full_name",  "").strip()
+                email       = fields.get("email",      "").strip()
+
+                # Handle full_name if split names not provided
+                if not first_name and full_name:
+                    parts      = full_name.split(" ", 1)
+                    first_name = parts[0]
+                    last_name  = parts[1] if len(parts) > 1 else ""
+
+                list_id     = META_DEFAULT_LIST_ID
+                campaign_id = META_DEFAULT_CAMP_ID
+
+                # 3) Validate phone
+                if not phone or not phone.isdigit():
+                    print(f"[Meta Webhook] Invalid phone for lead {leadgen_id}: '{phone}'")
+                    results.append({
+                        "leadgen_id": leadgen_id,
+                        "error":      "Invalid or missing phone number",
+                        "raw_fields": fields
+                    })
+                    continue
+
+                # 4) Validate list belongs to campaign
+                if list_id and campaign_id:
+                    if not validate_list_campaign(list_id, campaign_id):
+                        print(f"[Meta Webhook] list_id {list_id} not valid for campaign {campaign_id}")
+                        results.append({
+                            "leadgen_id": leadgen_id,
+                            "error":      f"list_id {list_id} not in campaign {campaign_id}"
+                        })
+                        continue
+
+                # 5) Push to VICIdial
+                vici_result = push_lead_to_vicidial(
+                    phone=phone, first_name=first_name,
+                    last_name=last_name, email=email,
+                    list_id=list_id
+                )
+
+                print(f"[Meta Webhook] VICIdial result for {phone}: {vici_result}")
+                results.append({
+                    "leadgen_id":  leadgen_id,
+                    "phone":       phone,
+                    "first_name":  first_name,
+                    "last_name":   last_name,
+                    "email":       email,
+                    "list_id":     list_id,
+                    "vici_result": vici_result
+                })
+
+    except Exception as e:
+        print(f"[Meta Webhook] Unhandled error: {e}")
+        # Always return 200 to Facebook or it will keep retrying
+        return PlainTextResponse(content="OK", status_code=200)
+
+    return PlainTextResponse(content="OK", status_code=200)
+
+
+# ── Privacy / Terms / Delete (required by Meta app review) ────
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy_policy():
+    return f"""
+    <h1>Privacy Policy</h1>
+    <p>Last updated: {date.today().strftime("%B %d, %Y")}</p>
+    <p>Spectra Global Ltd. collects and processes user data obtained from Facebook Lead Ads.</p>
+    <h2>Information We Collect</h2>
+    <p>Name, email, phone number, and other details submitted through Facebook Lead Ads forms.</p>
+    <h2>How We Use Information</h2>
+    <p>Data is used solely for business communication, lead management, and customer support.</p>
+    <h2>Data Sharing</h2>
+    <p>We do not sell or share your personal data with third parties.</p>
+    <h2>Data Security</h2>
+    <p>We take reasonable steps to protect your data from unauthorized access.</p>
+    <h2>User Rights</h2>
+    <p>You can request access or deletion of your data at any time.</p>
+    <h2>Contact Us</h2>
+    <p>Email: sgfxglobal@gmail.com</p>
+    """
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms_of_service():
+    return f"""
+    <h1>Terms of Service</h1>
+    <p>Last updated: {date.today().strftime("%B %d, %Y")}</p>
+    <p>By using our services, you agree to the following terms.</p>
+    <h2>Use of Service</h2>
+    <p>Our service collects and manages leads from Facebook Lead Ads.</p>
+    <h2>User Responsibility</h2>
+    <p>You agree to provide accurate information when submitting forms.</p>
+    <h2>Data Usage</h2>
+    <p>Submitted data may be used for communication and business purposes.</p>
+    <h2>Limitation of Liability</h2>
+    <p>We are not liable for any damages arising from the use of this service.</p>
+    <h2>Contact</h2>
+    <p>Email: sgfxglobal@gmail.com</p>
+    """
+
+@app.get("/delete-data")
+def delete_data_info():
+    return PlainTextResponse("Send your data deletion request to sgfxglobal@gmail.com")
+
+
+
