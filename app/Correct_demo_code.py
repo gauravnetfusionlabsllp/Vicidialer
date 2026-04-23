@@ -226,6 +226,23 @@ def get_pg_conn():
 def normalize_phone(phone):
     return str(phone).strip()[-10:]
 
+# def clean_phone(value):
+#     if value is None or value == "":
+#         return ""
+#     value = str(value).strip()
+#     if "E" in value.upper():
+#         try:
+#             value = "{:.0f}".format(float(value))
+#         except:
+#             return ""
+#     if isinstance(value, (int, float)):
+#         value = str(int(value))
+#     value = str(value).strip()
+#     if value.endswith(".0"):
+#         value = value[:-2]
+#     value = value.replace(" ", "")
+#     return value
+
 def clean_phone(value):
     if value is None or value == "":
         return ""
@@ -241,6 +258,7 @@ def clean_phone(value):
     if value.endswith(".0"):
         value = value[:-2]
     value = value.replace(" ", "")
+    value = re.sub(r'\D', '', value)   # ← strip +, dashes, parens, etc.
     return value
 
 def load_existing_phones():
@@ -1980,7 +1998,12 @@ META_DEFAULT_CAMP_ID = os.getenv("META_DEFAULT_CAMPAIGN_ID", "")
 async def fetch_meta_lead(leadgen_id: str) -> dict:
     url = f"https://graph.facebook.com/v19.0/{leadgen_id}"
     async with httpx.AsyncClient() as client:
-        res = await client.get(url, params={"access_token": PAGE_ACCESS_TOKEN})
+        res = await client.get(url, params={
+            "access_token": PAGE_ACCESS_TOKEN,
+            "fields": "field_data,created_time,ad_id,ad_name,form_id,id"
+        })
+        if res.status_code != 200:
+            print(f"[Meta Webhook] Graph API error {res.status_code}: {res.text}")
         res.raise_for_status()
         return res.json()
 
@@ -2013,7 +2036,7 @@ def push_lead_to_vicidial(phone: str, first_name: str, last_name: str,
         "function":     "add_lead",
         "phone_number": phone,
         "phone_code":   "1",
-        "list_id":      7022026,
+        "list_id":      list_id,
         "first_name":   first_name,
         "last_name":    last_name,
         "email":        email,
@@ -2100,6 +2123,8 @@ async def receive_facebook_webhook(request: Request):
                     first_name = parts[0]
                     last_name  = parts[1] if len(parts) > 1 else ""
 
+                
+                last_name = f"{last_name} {leadgen_id}_{form_id}".strip()
                 list_id     = META_DEFAULT_LIST_ID
                 campaign_id = META_DEFAULT_CAMP_ID
 
@@ -2192,6 +2217,72 @@ def terms_of_service():
 @app.get("/delete-data")
 def delete_data_info():
     return PlainTextResponse("Send your data deletion request to sgfxglobal@gmail.com")
+
+
+
+@app.post("/meta/upload-lead")
+async def manual_meta_lead_upload(
+    leadgen_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Manually fetch a lead from Meta by leadgen_id and push to VICIdial.
+    Use this to test or re-process a lead that the webhook missed.
+    """
+    try:
+        lead_data = await fetch_meta_lead(leadgen_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch from Meta: {str(e)}")
+
+    print(f"[Manual Upload] Lead data: {json.dumps(lead_data, indent=2)}")
+
+    field_data = lead_data.get("field_data", [])
+    fields     = parse_lead_fields(field_data)
+
+    phone      = clean_phone(
+        fields.get("phone_number")
+        or fields.get("phone")
+        or fields.get("mobile_number")
+        or ""
+    )
+    first_name = fields.get("first_name", "").strip()
+    last_name  = fields.get("last_name",  "").strip()
+    full_name  = fields.get("full_name",  "").strip()
+    email      = fields.get("email",      "").strip()
+
+    if not first_name and full_name:
+        parts      = full_name.split(" ", 1)
+        first_name = parts[0]
+        last_name  = parts[1] if len(parts) > 1 else ""
+
+    form_id   = lead_data.get("form_id", "")
+    last_name = f"{last_name} {leadgen_id}_{form_id}".strip()
+    list_id     = META_DEFAULT_LIST_ID
+    campaign_id = META_DEFAULT_CAMP_ID
+
+    if not phone or not phone.isdigit():
+        raise HTTPException(status_code=400, detail=f"Invalid phone: '{phone}' | Raw fields: {fields}")
+
+    if list_id and campaign_id:
+        if not validate_list_campaign(list_id, campaign_id):
+            raise HTTPException(status_code=400, detail=f"list_id {list_id} not valid for campaign {campaign_id}")
+
+    result = push_lead_to_vicidial(
+        phone=phone, first_name=first_name,
+        last_name=last_name, email=email,
+        list_id=list_id
+    )
+
+    return {
+        "leadgen_id":  leadgen_id,
+        "phone":       phone,
+        "first_name":  first_name,
+        "last_name":   last_name,
+        "email":       email,
+        "list_id":     list_id,
+        "raw_fields":  fields,
+        "vici_result": result
+    }
 
 
 
