@@ -1353,6 +1353,57 @@ def get_LeadFunnel(request: Request, current_user: str = Depends(get_current_use
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# @app.get('/hourlyperformance')
+# def get_hourlyperformance(request: Request, current_user: str = Depends(get_current_user)):
+#     try:
+#         conn        = mysql.connector.connect(**DB_CONFIG)
+#         cursor      = conn.cursor(dictionary=True)
+#         today_start = date.today()
+#         campaign_id = request.query_params.get("campaign_id")
+#         user_id     = request.query_params.get("user_id")
+#         admin_user  = current_user["username"]
+
+#         filters = []
+
+#         # Always restrict admin to only their assigned campaigns
+#         filters.append(f"""
+#             campaign_id IN (
+#                 SELECT campaign_id FROM vicidial_campaign_agents WHERE user = '{admin_user}'
+#             )
+#         """)
+
+#         # Exclude system/dialer user
+#         filters.append("user != 'VDAD'")
+
+#         if campaign_id:
+#             filters.append(f"campaign_id = '{campaign_id}'")
+#         if user_id:
+#             filters.append(f"user = '{user_id}'")
+
+#         extra_filter = ("AND " + " AND ".join(filters)) if filters else ""
+
+#         cursor.execute(f"""
+#             SELECT HOUR(event_time) AS hour, COUNT(*) AS total_calls,SUM(IF(status NOT IN (
+#                     'N', 'B', 'AB', 'D', 'DROP', 
+#                     'INVN', 'NA', 'DNC','ADC','FUC','NA'
+#                 ), 1, 0))  AS connected_calls
+#             FROM vicidial_agent_log
+#             WHERE DATE(event_time) = %s and status is not NULL
+#             {extra_filter}
+#             GROUP BY HOUR(event_time) ORDER BY hour
+#         """, (today_start,))
+
+#         result = cursor.fetchall()
+#         cursor.close()
+#         conn.close()
+#         return {
+#             "hours":           [r["hour"] for r in result],
+#             "total_calls":     [r["total_calls"] for r in result],
+#             "connected_calls": [r["connected_calls"] for r in result]
+#         }
+#     except Error as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+
 @app.get('/hourlyperformance')
 def get_hourlyperformance(request: Request, current_user: str = Depends(get_current_user)):
     try:
@@ -1362,36 +1413,69 @@ def get_hourlyperformance(request: Request, current_user: str = Depends(get_curr
         campaign_id = request.query_params.get("campaign_id")
         user_id     = request.query_params.get("user_id")
         admin_user  = current_user["username"]
+        is_admin    = current_user["isAdmin"]
 
-        filters = []
+        filters       = []
+        filter_params = []
 
-        # Always restrict admin to only their assigned campaigns
-        filters.append(f"""
-            campaign_id IN (
-                SELECT campaign_id FROM vicidial_campaign_agents WHERE user = '{admin_user}'
+        # ✅ ROLE BASED ACCESS CONTROL
+        filters.append("""
+            (
+                (SELECT user_level FROM vicidial_users WHERE user = %s) = 9
+                OR (
+                    (SELECT user_level FROM vicidial_users WHERE user = %s) > 1
+                    AND vu.user_group = (SELECT user_group FROM vicidial_users WHERE user = %s)
+                )
+                OR (
+                    (SELECT user_level FROM vicidial_users WHERE user = %s) = 1
+                    AND val.user = %s
+                )
             )
         """)
+        filter_params.extend([admin_user, admin_user, admin_user, admin_user, admin_user])
 
-        # Exclude system/dialer user
-        filters.append("user != 'VDAD'")
+        # ✅ RESTRICT TO ASSIGNED CAMPAIGNS
+        filters.append("""
+            val.campaign_id IN (
+                SELECT campaign_id FROM vicidial_campaign_agents WHERE user = %s
+            )
+        """)
+        filter_params.append(admin_user)
 
-        if campaign_id:
-            filters.append(f"campaign_id = '{campaign_id}'")
-        if user_id:
-            filters.append(f"user = '{user_id}'")
+        filters.append("val.user != 'VDAD'")
+        filters.append("val.status IS NOT NULL")
+
+        # ✅ OPTIONAL FILTERS
+        if not is_admin:
+            filters.append("val.campaign_id = %s")
+            filter_params.append(current_user["campaign_id"])
+            filters.append("val.user = %s")
+            filter_params.append(admin_user)
+        else:
+            if campaign_id:
+                filters.append("val.campaign_id = %s")
+                filter_params.append(campaign_id)
+            if user_id:
+                filters.append("val.user = %s")
+                filter_params.append(user_id)
 
         extra_filter = ("AND " + " AND ".join(filters)) if filters else ""
 
         cursor.execute(f"""
-            SELECT HOUR(event_time) AS hour, COUNT(*) AS total_calls,SUM(IF(status NOT IN (
-                    'N', 'B', 'AB', 'D', 'DROP', 
-                    'INVN', 'NA', 'DNC','ADC','FUC','NA'
-                ), 1, 0))  AS connected_calls
-            FROM vicidial_agent_log
-            WHERE DATE(event_time) = %s and status is not NULL
+            SELECT
+                HOUR(val.event_time) AS hour,
+                COUNT(*)             AS total_calls,
+                SUM(IF(val.status NOT IN (
+                    'N', 'B', 'AB', 'D', 'DROP',
+                    'INVN', 'NA', 'DNC', 'ADC', 'FUC', 'NA'
+                ), 1, 0))            AS connected_calls
+            FROM vicidial_agent_log val
+            LEFT JOIN vicidial_users vu ON val.user = vu.user
+            WHERE DATE(val.event_time) = %s
             {extra_filter}
-            GROUP BY HOUR(event_time) ORDER BY hour
-        """, (today_start,))
+            GROUP BY HOUR(val.event_time)
+            ORDER BY hour
+        """, (today_start, *filter_params))
 
         result = cursor.fetchall()
         cursor.close()
@@ -1403,7 +1487,6 @@ def get_hourlyperformance(request: Request, current_user: str = Depends(get_curr
         }
     except Error as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get('/graphdata')
 def get_GraphData(current_user: str = Depends(get_current_user)):
@@ -1605,9 +1688,12 @@ def delet_lead(data: DeleteLeadRequest, current_user: str = Depends(get_current_
     except Error as e:
         raise HTTPException(status_code=500, detail=f"Error deleting records: {e}")
 
-
 @app.post("/clients_for_agent")
-def clients_for_agent(callbackOnly: Optional[bool] = False, current_user: str = Depends(get_current_user)):
+def clients_for_agent(
+    callbackOnly: Optional[bool] = False,
+    form_name: Optional[str] = None,          # ← ADD THIS
+    current_user: str = Depends(get_current_user)
+):
     conn        = mysql.connector.connect(**DB_CONFIG)
     cursor      = conn.cursor(dictionary=True)
     user_id     = current_user["username"]
@@ -1626,28 +1712,42 @@ def clients_for_agent(callbackOnly: Optional[bool] = False, current_user: str = 
               AND vla.lead_id IS NULL AND vls.campaign_id = %s AND vl.status IN ('CBR','CBHOLD')
         """, (user_id, campaign_id))
     else:
-        cursor.execute("""
+        # Build form_name filter only for HOTMETALeads campaign
+        form_filter       = ""
+        form_filter_param = []
+        if form_name:
+            form_name = form_name.strip("'\"").strip()
+            if form_name.lower() == "none":
+                form_name = None
+
+        # Fix campaign_id to match your actual value
+        if campaign_id == "Metalead" and form_name:        # ← was "HOTMETALeads"
+            form_filter       = "AND vl.last_name LIKE %s"
+            form_filter_param = [f"%{form_name}%"]
+        # print(f"[DEBUG] campaign_id='{campaign_id}' form_name='{form_name}'")
+
+        cursor.execute(f"""
             SELECT DISTINCT vl.title, vl.first_name, vl.last_name, vl.city, vl.country_code,
                    date(vl.entry_date) entry_date, vl.date_of_birth, vl.list_id,
                    NULL callback_time, NULL comments, vl.lead_id, vl.status, vls.campaign_id
             FROM vicidial_list vl INNER JOIN vicidial_lists vls ON vl.list_id = vls.list_id
             WHERE vl.lead_id NOT IN (SELECT DISTINCT lead_id FROM vicidial_log)
-              AND vl.status IN ('NEW') AND vls.campaign_id = %s and vl.user in (%s,'AdminR')
-            ORDER BY vl.lead_id desc
-        """, (campaign_id,user_id,))
+              AND vl.status IN ('NEW') AND vls.campaign_id = %s AND vl.user IN (%s,'AdminR')
+              {form_filter}
+            ORDER BY vl.lead_id DESC
+        """, (campaign_id, user_id, *form_filter_param))
 
     data = cursor.fetchall()
     cursor.close()
     conn.close()
     return {"status": "success", "total_records": len(data), "data": data}
 
-
 # ═══════════════════════════════════════════════════════════════
 #  CALLING ROUTES
 # ═══════════════════════════════════════════════════════════════
 
 @app.post("/call")
-def call_number(phone: Optional[str] = None, current_user: str = Depends(get_current_user)):
+def call_number(phone: Optional[str] = None, form_name: Optional[str] = None, current_user: str = Depends(get_current_user)):
     userDetails = None
     lead_id     = None
     agent_user  = current_user["username"]
@@ -1671,22 +1771,35 @@ def call_number(phone: Optional[str] = None, current_user: str = Depends(get_cur
             conn       = mysql.connector.connect(**DB_CONFIG)
             cursor     = conn.cursor(dictionary=True)
             lock_token = f"{agent_user}_{int(time.time()*1000)}"
-            cursor.execute("""
+
+            # Sanitize form_name
+            if form_name:
+                form_name = form_name.strip("'\"").strip()
+                if form_name.lower() == "none":
+                    form_name = None
+
+            # Build form_name filter
+            form_filter       = ""
+            form_filter_param = []
+            if campaign_id == "Metalead" and form_name:
+                form_filter       = "AND vl.last_name LIKE %s"
+                form_filter_param = [f"%{form_name}%"]
+            cursor.execute(f"""
                 UPDATE vicidial_list vl
                 INNER JOIN vicidial_lists vls ON vl.list_id = vls.list_id
                 SET vl.status = 'INCALL', vl.user = %s
                 WHERE vl.status = 'NEW' AND vls.campaign_id = %s
-                  AND vl.lead_id NOT IN (SELECT lead_id FROM vicidial_log)
-                ORDER BY vl.lead_id ASC LIMIT 1
-            """, (lock_token, campaign_id))
+                  AND vl.lead_id NOT IN (SELECT lead_id FROM vicidial_log) {form_filter}
+                ORDER BY vl.lead_id DESC  LIMIT 1
+            """, (lock_token, campaign_id,*form_filter_param))
             conn.commit()
             if cursor.rowcount == 0:
-                raise HTTPException(404, "No callable leads found")
+                raise HTTPException(404, f"No callable leads found{f' for form: {form_name}' if form_name else ''}")
             cursor.execute("""
                 SELECT vl.lead_id, vl.phone_number, vl.first_name, vl.last_name, vl.comments
                 FROM vicidial_list vl
                 WHERE vl.user = %s AND vl.status = 'INCALL'
-                ORDER BY vl.lead_id ASC LIMIT 1
+                ORDER BY vl.lead_id DESC  LIMIT 1
             """, (lock_token,))
             row = cursor.fetchone()
             if not row:
@@ -2007,6 +2120,66 @@ async def fetch_meta_lead(leadgen_id: str) -> dict:
         res.raise_for_status()
         return res.json()
 
+async def fetch_form_name(form_id: str) -> str:
+    if not form_id:
+        print("[fetch_form_name] No form_id provided")
+        return ""
+    url = f"https://graph.facebook.com/v19.0/{form_id}"
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url, params={
+            "access_token": PAGE_ACCESS_TOKEN,
+            "fields": "name"
+        })
+        print(f"[fetch_form_name] status={res.status_code} body={res.text}")  # ← ADD THIS
+        if res.status_code == 200:
+            return res.json().get("name", "")
+        return ""
+    
+# ─────────────────────────────────────────────
+# HELPER: To save Meta data to New Databse 
+# ─────────────────────────────────────────────
+def save_meta_lead_to_pg(
+    leadgen_id:    str,
+    form_id:       str,
+    form_name:     str,
+    campaign_id:   str,
+    campaign_name: str,
+    phone_number:  str,
+    email:         str,
+    first_name:    str,
+    last_name:     str,
+    raw_fields:    dict,
+    source:        str = "webhook"
+):
+    try:
+        conn   = get_pg_conn()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO meta_leads
+                (leadgen_id, form_id, form_name, campaign_id, campaign_name,
+                 phone_number, email, first_name, last_name, raw_fields,source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,%s)
+            ON CONFLICT (leadgen_id) DO UPDATE SET
+                form_name     = EXCLUDED.form_name,
+                campaign_name = EXCLUDED.campaign_name,
+                phone_number  = EXCLUDED.phone_number,
+                email         = EXCLUDED.email,
+                first_name    = EXCLUDED.first_name,
+                last_name     = EXCLUDED.last_name,
+                raw_fields    = EXCLUDED.raw_fields,
+                source        = EXCLUDED.source
+        """, (
+            leadgen_id, form_id, form_name, campaign_id, campaign_name,
+            phone_number, email, first_name, last_name,
+            json.dumps(raw_fields),source
+        ))
+        conn.commit()
+        print(f"[Meta PG] Lead saved: leadgen_id={leadgen_id} form_name={form_name}")
+    except Exception as e:
+        print(f"[Meta PG] Failed to save lead {leadgen_id}: {e}")
+    finally:
+        cursor.close()
+        conn.close()
 
 # ─────────────────────────────────────────────
 # HELPER: parse field_data list → flat dict
@@ -2023,6 +2196,26 @@ def parse_lead_fields(field_data: list) -> dict:
         result[key] = vals[0] if vals else ""
     return result
 
+# ─────────────────────────────────────────────
+# HELPER: To Fetch Campaign Name for Meta Leads 
+# ─────────────────────────────────────────────
+async def fetch_campaign_name(ad_id: str) -> tuple[str, str]:
+    """Returns (campaign_id, campaign_name) from ad_id"""
+    if not ad_id:
+        return "", ""
+    url = f"https://graph.facebook.com/v19.0/{ad_id}"
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url, params={
+            "access_token": PAGE_ACCESS_TOKEN,
+            "fields": "campaign_id,campaign{name}"
+        })
+        print(f"[fetch_campaign_name] status={res.status_code} body={res.text}")
+        if res.status_code == 200:
+            data        = res.json()
+            campaign_id = data.get("campaign_id", "")
+            campaign    = data.get("campaign", {})
+            return campaign_id, campaign.get("name", "")
+    return "", ""
 
 # ─────────────────────────────────────────────
 # HELPER: push one lead into VICIdial
@@ -2083,9 +2276,8 @@ async def receive_facebook_webhook(request: Request):
                 if change.get("field") != "leadgen":
                     continue
 
-                leadgen_id  = change["value"].get("leadgen_id")
-                form_id     = change["value"].get("form_id", "")
-                page_id     = change["value"].get("page_id", "")
+                leadgen_id = change["value"].get("leadgen_id")
+                form_id    = change["value"].get("form_id", "")
 
                 if not leadgen_id:
                     continue
@@ -2094,7 +2286,7 @@ async def receive_facebook_webhook(request: Request):
 
                 # 1) Fetch full lead data from Graph API
                 try:
-                    lead_data  = await fetch_meta_lead(leadgen_id)
+                    lead_data = await fetch_meta_lead(leadgen_id)
                 except Exception as e:
                     print(f"[Meta Webhook] Failed to fetch lead {leadgen_id}: {e}")
                     results.append({"leadgen_id": leadgen_id, "error": str(e)})
@@ -2103,32 +2295,52 @@ async def receive_facebook_webhook(request: Request):
                 print(f"[Meta Webhook] Lead data: {json.dumps(lead_data, indent=2)}")
 
                 # 2) Parse fields
-                field_data  = lead_data.get("field_data", [])
-                fields      = parse_lead_fields(field_data)
+                field_data = lead_data.get("field_data", [])
+                fields     = parse_lead_fields(field_data)
+                form_id    = lead_data.get("form_id", form_id)   # prefer lead_data
+                ad_id      = lead_data.get("ad_id", "")
 
-                phone       = clean_phone(
+                # Fetch form name and campaign name in parallel
+                form_name                    = await fetch_form_name(form_id)
+                meta_campaign_id, meta_campaign_name = await fetch_campaign_name(ad_id)
+
+                phone      = clean_phone(
                     fields.get("phone_number")
                     or fields.get("phone")
                     or fields.get("mobile_number")
                     or ""
                 )
-                first_name  = fields.get("first_name", "").strip()
-                last_name   = fields.get("last_name",  "").strip()
-                full_name   = fields.get("full_name",  "").strip()
-                email       = fields.get("email",      "").strip()
+                first_name = fields.get("first_name", "").strip()
+                last_name  = fields.get("last_name",  "").strip()
+                full_name  = fields.get("full_name",  "").strip()
+                email      = fields.get("email",      "").strip()
 
-                # Handle full_name if split names not provided
                 if not first_name and full_name:
                     parts      = full_name.split(" ", 1)
                     first_name = parts[0]
                     last_name  = parts[1] if len(parts) > 1 else ""
 
-                
-                last_name = f"{last_name} {leadgen_id}_{form_id}".strip()
+                # 3) Save to PostgreSQL
+                save_meta_lead_to_pg(
+                    leadgen_id    = leadgen_id,
+                    form_id       = form_id,
+                    form_name     = form_name,
+                    campaign_id   = meta_campaign_id,
+                    campaign_name = meta_campaign_name,
+                    phone_number  = phone,
+                    email         = email,
+                    first_name    = first_name,
+                    last_name     = last_name,
+                    raw_fields    = fields,
+                    source        = "FaceBook"
+                    
+                )
+
+                last_name   = f"{form_name}".strip()
                 list_id     = META_DEFAULT_LIST_ID
                 campaign_id = META_DEFAULT_CAMP_ID
 
-                # 3) Validate phone
+                # 4) Validate phone
                 if not phone or not phone.isdigit():
                     print(f"[Meta Webhook] Invalid phone for lead {leadgen_id}: '{phone}'")
                     results.append({
@@ -2138,7 +2350,7 @@ async def receive_facebook_webhook(request: Request):
                     })
                     continue
 
-                # 4) Validate list belongs to campaign
+                # 5) Validate list belongs to campaign
                 if list_id and campaign_id:
                     if not validate_list_campaign(list_id, campaign_id):
                         print(f"[Meta Webhook] list_id {list_id} not valid for campaign {campaign_id}")
@@ -2148,7 +2360,7 @@ async def receive_facebook_webhook(request: Request):
                         })
                         continue
 
-                # 5) Push to VICIdial
+                # 6) Push to VICIdial
                 vici_result = push_lead_to_vicidial(
                     phone=phone, first_name=first_name,
                     last_name=last_name, email=email,
@@ -2157,18 +2369,19 @@ async def receive_facebook_webhook(request: Request):
 
                 print(f"[Meta Webhook] VICIdial result for {phone}: {vici_result}")
                 results.append({
-                    "leadgen_id":  leadgen_id,
-                    "phone":       phone,
-                    "first_name":  first_name,
-                    "last_name":   last_name,
-                    "email":       email,
-                    "list_id":     list_id,
-                    "vici_result": vici_result
+                    "leadgen_id":    leadgen_id,
+                    "form_name":     form_name,
+                    "campaign_name": meta_campaign_name,
+                    "phone":         phone,
+                    "first_name":    first_name,
+                    "last_name":     last_name,
+                    "email":         email,
+                    "list_id":       list_id,
+                    "vici_result":   vici_result
                 })
 
     except Exception as e:
         print(f"[Meta Webhook] Unhandled error: {e}")
-        # Always return 200 to Facebook or it will keep retrying
         return PlainTextResponse(content="OK", status_code=200)
 
     return PlainTextResponse(content="OK", status_code=200)
@@ -2225,10 +2438,6 @@ async def manual_meta_lead_upload(
     leadgen_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Manually fetch a lead from Meta by leadgen_id and push to VICIdial.
-    Use this to test or re-process a lead that the webhook missed.
-    """
     try:
         lead_data = await fetch_meta_lead(leadgen_id)
     except Exception as e:
@@ -2238,6 +2447,11 @@ async def manual_meta_lead_upload(
 
     field_data = lead_data.get("field_data", [])
     fields     = parse_lead_fields(field_data)
+    form_id    = lead_data.get("form_id", "")
+    ad_id      = lead_data.get("ad_id", "")
+
+    form_name                    = await fetch_form_name(form_id)
+    meta_campaign_id, meta_campaign_name = await fetch_campaign_name(ad_id)
 
     phone      = clean_phone(
         fields.get("phone_number")
@@ -2255,8 +2469,21 @@ async def manual_meta_lead_upload(
         first_name = parts[0]
         last_name  = parts[1] if len(parts) > 1 else ""
 
-    form_id   = lead_data.get("form_id", "")
-    last_name = f"{last_name} {leadgen_id}_{form_id}".strip()
+    save_meta_lead_to_pg(
+        leadgen_id    = leadgen_id,
+        form_id       = form_id,
+        form_name     = form_name,
+        campaign_id   = meta_campaign_id,
+        campaign_name = meta_campaign_name,
+        phone_number  = phone,
+        email         = email,
+        first_name    = first_name,
+        last_name     = last_name,
+        raw_fields    = fields,
+        source        = "manual"
+    )
+
+    last_name   = f"{form_name}".strip()
     list_id     = META_DEFAULT_LIST_ID
     campaign_id = META_DEFAULT_CAMP_ID
 
@@ -2274,14 +2501,17 @@ async def manual_meta_lead_upload(
     )
 
     return {
-        "leadgen_id":  leadgen_id,
-        "phone":       phone,
-        "first_name":  first_name,
-        "last_name":   last_name,
-        "email":       email,
-        "list_id":     list_id,
-        "raw_fields":  fields,
-        "vici_result": result
+        "leadgen_id":    leadgen_id,
+        "form_name":     form_name,
+        "campaign_id":   meta_campaign_id,
+        "campaign_name": meta_campaign_name,
+        "phone":         phone,
+        "first_name":    first_name,
+        "last_name":     last_name,
+        "email":         email,
+        "list_id":       list_id,
+        "raw_fields":    fields,
+        "vici_result":   result
     }
 
 
