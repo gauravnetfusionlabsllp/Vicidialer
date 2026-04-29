@@ -2,7 +2,7 @@
 #  VICIdial Dashboard API
 #  v7.0.0 — Call Analysis Removed
 # ═══════════════════════════════════════════════════════════════
-
+from dependencies import get_current_user, get_pg_conn, get_mysql_conn
 from fastapi import FastAPI, Form, HTTPException, Query, Request, UploadFile, File, Depends, status, APIRouter
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,6 +33,8 @@ import re
 import json
 from dotenv import load_dotenv
 from urllib.parse import quote
+from email_routes import email_router
+from fastapi.staticfiles import StaticFiles 
 
 load_dotenv()
 
@@ -95,7 +97,11 @@ WHATSAPP_TOKEN               = "your_meta_api_token"
 PHONE_NUMBER_ID              = "your_office_number_id"
 PREFILLED_TEXT               = quote("Hello! I'm interested in your services. Please contact me.")
 WHATSAPP_LINK                = f"https://wa.me/{WHATSAPP_NUMBER}?text={PREFILLED_TEXT}"
-twilio_client                = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+try:
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+except Exception as e:
+    print(f"[WARNING] Twilio init failed: {e}")
+    twilio_client = None
 
 # ─────────────────────────────────────────────
 # FASTAPI APP
@@ -110,14 +116,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.mount("/email_attachments", StaticFiles(directory="email_attachments"), name="email_attachments")
+app.include_router(email_router)
+
 # ─────────────────────────────────────────────
 # POSTGRESQL POOL (for sessions)
 # ─────────────────────────────────────────────
-pgsqlPool = pool.SimpleConnectionPool(
-    minconn=1, maxconn=20,
-    dbname="customDialer", user="postgres",
-    password="Soft!@7890", host="192.168.15.105"
-)
+
+try:
+    pgsqlPool = pool.SimpleConnectionPool(
+        minconn=1, maxconn=20,
+        dbname="customDialer", user="postgres",
+        password="Soft!@7890", host="192.168.15.105"
+    )
+except Exception as e:
+    print(f"[FATAL] PostgreSQL pool failed: {e}")
+    pgsqlPool = None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -184,39 +198,39 @@ def create_refresh_token(data: dict):
     to_encode.update({"exp": datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS), "type": "refresh"})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-def get_current_user(token: str = Depends(oauth2_scheme)):
-    try:
-        payload       = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username      = payload.get("sub")
-        is_admin      = payload.get("isAdmin", False)
-        user_level    = payload.get("user_level", 1)
-        campaign_name = payload.get("campaign_name")
-        campaign_id   = payload.get("campaign_id")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return {"username": username, "isAdmin": is_admin,"user_level":user_level,"campaign_name": campaign_name, "campaign_id": campaign_id}
-    except JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired or invalid")
+# def get_current_user(token: str = Depends(oauth2_scheme)):
+#     try:
+#         payload       = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+#         username      = payload.get("sub")
+#         is_admin      = payload.get("isAdmin", False)
+#         user_level    = payload.get("user_level", 1)
+#         campaign_name = payload.get("campaign_name")
+#         campaign_id   = payload.get("campaign_id")
+#         if username is None:
+#             raise HTTPException(status_code=401, detail="Invalid token")
+#         return {"username": username, "isAdmin": is_admin,"user_level":user_level,"campaign_name": campaign_name, "campaign_id": campaign_id}
+#     except JWTError:
+#         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired or invalid")
 
 
 # ─────────────────────────────────────────────
 # DB CONNECTION HELPERS
 # ─────────────────────────────────────────────
 
-def get_mysql_conn():
-    return pymysql.connect(
-        host=MYSQL_DB["host"], port=MYSQL_DB["port"],
-        user=MYSQL_DB["user"], password=MYSQL_DB["password"],
-        database=MYSQL_DB["database"],
-        cursorclass=pymysql.cursors.DictCursor, charset="utf8mb4"
-    )
+# def get_mysql_conn():
+#     return pymysql.connect(
+#         host=MYSQL_DB["host"], port=MYSQL_DB["port"],
+#         user=MYSQL_DB["user"], password=MYSQL_DB["password"],
+#         database=MYSQL_DB["database"],
+#         cursorclass=pymysql.cursors.DictCursor, charset="utf8mb4"
+#     )
 
-def get_pg_conn():
-    return psycopg2.connect(
-        host=POSTGRES_DB["host"], port=POSTGRES_DB["port"],
-        user=POSTGRES_DB["user"], password=POSTGRES_DB["password"],
-        dbname=POSTGRES_DB["database"]
-    )
+# def get_pg_conn():
+#     return psycopg2.connect(
+#         host=POSTGRES_DB["host"], port=POSTGRES_DB["port"],
+#         user=POSTGRES_DB["user"], password=POSTGRES_DB["password"],
+#         dbname=POSTGRES_DB["database"]
+#     )
 
 
 # ─────────────────────────────────────────────
@@ -351,14 +365,6 @@ def refresh_token(data: RefreshRequest):
 
     except JWTError:
         raise HTTPException(status_code=401, detail="Refresh token expired or invalid")
-# ═══════════════════════════════════════════════════════════════
-#  STARTUP
-# ═══════════════════════════════════════════════════════════════
-
-@app.on_event("startup")
-def startup():
-    print("[Startup] Application started.")
-
 
 # ═══════════════════════════════════════════════════════════════
 #  AUTH ROUTES
@@ -760,7 +766,6 @@ def get_totaldials(request: Request, current_user: dict = Depends(get_current_us
         print(e)
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get('/metalead-stats')
 def get_lead_stats(request: Request, current_user: dict = Depends(get_current_user)):
     try:
@@ -795,12 +800,6 @@ def get_lead_stats(request: Request, current_user: dict = Depends(get_current_us
                 filters.append(f"vl.user = '{user_id}'")
             extra_filter = ("AND " + " AND ".join(filters)) if filters else ""
 
-        date_filter = ""
-        date_params = []
-        if sd and ed:
-            date_filter = "AND DATE(vl.entry_date) BETWEEN %s AND %s"
-            date_params = [sd, ed]
-
         scope_filter = """
             AND vl.user IN (
                 SELECT DISTINCT vca.user
@@ -813,49 +812,64 @@ def get_lead_stats(request: Request, current_user: dict = Depends(get_current_us
             )
         """
 
-        # ── Query 1: Total Leads (only list_id) ──────────────────────────
-        q1 = """
+        # ── Shared date filter (entry_date) ───────────────────────────────
+        date_filter        = ""
+        date_params        = []
+        if sd and ed:
+            date_filter  = "AND DATE(vl.entry_date) BETWEEN %s AND %s"
+            date_params  = [sd, ed]
+        elif sd:
+            date_filter  = "AND DATE(vl.entry_date) >= %s"
+            date_params  = [sd]
+        elif ed:
+            date_filter  = "AND DATE(vl.entry_date) <= %s"
+            date_params  = [ed]
+
+        # ── Called leads: filter by last_local_call_time ──────────────────
+        date_filter_called = ""
+        date_params_called = []
+        if sd and ed:
+            date_filter_called = "AND DATE(vl.last_local_call_time) BETWEEN %s AND %s"
+            date_params_called = [sd, ed]
+        elif sd:
+            date_filter_called = "AND DATE(vl.last_local_call_time) >= %s"
+            date_params_called = [sd]
+        elif ed:
+            date_filter_called = "AND DATE(vl.last_local_call_time) <= %s"
+            date_params_called = [ed]
+
+        # ── Query 1: Total Leads ──────────────────────────────────────────
+        q1 = f"""
             SELECT COUNT(*) AS total_leads
             FROM vicidial_list vl
             WHERE vl.list_id = %s
+              {date_filter}
         """
-        cursor.execute(q1, [list_id])
+        cursor.execute(q1, [list_id] + date_params)
         total_leads = cursor.fetchone()["total_leads"] or 0
 
         # ── Query 2: Called Leads ─────────────────────────────────────────
-        date_filter_called = ""
-        # if sd and ed:
-        #     date_filter_called = "AND DATE(vl.last_local_call_time) BETWEEN %s AND %s"
-
         q2 = f"""
             SELECT COUNT(*) AS called_leads
             FROM vicidial_list vl
             WHERE vl.list_id = %s
               AND vl.status != 'NEW'
-             
+              {date_filter_called}
         """
-        cursor.execute(q2, [list_id] )
+        cursor.execute(q2, [list_id] + date_params_called)
         called_leads = cursor.fetchone()["called_leads"] or 0
 
-        # ── Query 3: Pending Leads (list_id + status = NEW + all filters) ─
         # ── Query 3: Pending Leads ────────────────────────────────────────
-        # entry_date <= ed means "leads that existed by that date and still not called"
-        date_filter_pending = ""
-        date_params_pending = []
-        if ed:
-            date_filter_pending = "AND DATE(vl.entry_date) <= %s"
-            date_params_pending = [ed]
-
         q3 = f"""
             SELECT COUNT(*) AS pending_leads
             FROM vicidial_list vl
             WHERE vl.list_id = %s
               AND vl.status = 'NEW'
-              {date_filter_pending}
+              {date_filter}
               {scope_filter}
               {extra_filter}
         """
-        cursor.execute(q3, [list_id] + date_params_pending + [admin_user])
+        cursor.execute(q3, [list_id] + date_params + [admin_user])
         pending_leads = cursor.fetchone()["pending_leads"] or 0
 
         cursor.close()
@@ -873,7 +887,7 @@ def get_lead_stats(request: Request, current_user: dict = Depends(get_current_us
     except Error as e:
         print(e)
         raise HTTPException(status_code=500, detail=str(e))
-    
+     
 @app.get('/dialerperformance')
 def get_dialerperformance(request: Request, current_user: dict = Depends(get_current_user)):
     try:
@@ -2094,32 +2108,32 @@ def send_sms(data: SMSRequest):
 #  META / FACEBOOK LEAD WEBHOOK
 #  Add these env vars to your .env:
 #    VERIFY_TOKEN=your_verify_token
-#    PAGE_ACCESS_TOKEN=your_page_access_token
+#    SUPER_USER_TOKEN=your_SUPER_USER_TOKEN
 #    META_DEFAULT_LIST_ID=your_vicidial_list_id
 #    META_DEFAULT_CAMPAIGN_ID=your_vicidial_campaign_id
 # ═══════════════════════════════════════════════════════════════
 
 VERIFY_TOKEN         = os.getenv("VERIFY_TOKEN")
-PAGE_ACCESS_TOKEN    = os.getenv("PAGE_ACCESS_TOKEN")
+SUPER_USER_TOKEN    = os.getenv("SUPER_USER_TOKEN")
 META_DEFAULT_LIST_ID = os.getenv("META_DEFAULT_LIST_ID", "")
 META_DEFAULT_CAMP_ID = os.getenv("META_DEFAULT_CAMPAIGN_ID", "")
 
-
+PAGE_ACCESS_TOKEN   = os.getenv("PAGE_ACCESS_TOKEN")
 # ─────────────────────────────────────────────
 # HELPER: fetch full lead from Graph API
 # ─────────────────────────────────────────────
 async def fetch_meta_lead(leadgen_id: str) -> dict:
-    url = f"https://graph.facebook.com/v19.0/{leadgen_id}"
+    url = f"https://graph.facebook.com/v25.0/{leadgen_id}"
     async with httpx.AsyncClient() as client:
         res = await client.get(url, params={
-            "access_token": PAGE_ACCESS_TOKEN,
+            "access_token": SUPER_USER_TOKEN,
             "fields": "field_data,created_time,ad_id,ad_name,form_id,id"
         })
         if res.status_code != 200:
             print(f"[Meta Webhook] Graph API error {res.status_code}: {res.text}")
         res.raise_for_status()
         return res.json()
-
+# fetch_meta_lead("1676511057130221")
 async def fetch_form_name(form_id: str) -> str:
     if not form_id:
         print("[fetch_form_name] No form_id provided")
@@ -2127,7 +2141,7 @@ async def fetch_form_name(form_id: str) -> str:
     url = f"https://graph.facebook.com/v19.0/{form_id}"
     async with httpx.AsyncClient() as client:
         res = await client.get(url, params={
-            "access_token": PAGE_ACCESS_TOKEN,
+            "access_token": SUPER_USER_TOKEN,
             "fields": "name"
         })
         print(f"[fetch_form_name] status={res.status_code} body={res.text}")  # ← ADD THIS
@@ -2139,26 +2153,42 @@ async def fetch_form_name(form_id: str) -> str:
 # HELPER: To save Meta data to New Databse 
 # ─────────────────────────────────────────────
 def save_meta_lead_to_pg(
-    leadgen_id:    str,
-    form_id:       str,
-    form_name:     str,
-    campaign_id:   str,
-    campaign_name: str,
-    phone_number:  str,
-    email:         str,
-    first_name:    str,
-    last_name:     str,
-    raw_fields:    dict,
-    source:        str = "webhook"
+    leadgen_id, form_id, form_name, campaign_id, campaign_name,
+    phone_number, email, first_name, last_name, raw_fields, source="webhook"
 ):
+    conn   = None
+    cursor = None
     try:
         conn   = get_pg_conn()
         cursor = conn.cursor()
+
+        # ── Duplicate check: same phone + same form = skip ──
+        if phone_number and form_name:
+            cursor.execute(
+                """
+                SELECT id, leadgen_id 
+                FROM meta_leads 
+                WHERE phone_number = %s AND form_name = %s 
+                LIMIT 1
+                """,
+                (phone_number, form_name)
+            )
+            existing = cursor.fetchone()
+            if existing:
+                print(f"[Meta PG] DUPLICATE — phone={phone_number} already exists "
+                      f"in form='{form_name}' (id={existing[0]}, leadgen_id={existing[1]})")
+                # ← NO early close here, finally handles it
+                return {
+                    "saved":     False,
+                    "duplicate": True,
+                    "reason":    f"phone {phone_number} already submitted form '{form_name}'"
+                }
+
         cursor.execute("""
             INSERT INTO meta_leads
                 (leadgen_id, form_id, form_name, campaign_id, campaign_name,
-                 phone_number, email, first_name, last_name, raw_fields,source)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,%s)
+                 phone_number, email, first_name, last_name, raw_fields)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (leadgen_id) DO UPDATE SET
                 form_name     = EXCLUDED.form_name,
                 campaign_name = EXCLUDED.campaign_name,
@@ -2166,20 +2196,30 @@ def save_meta_lead_to_pg(
                 email         = EXCLUDED.email,
                 first_name    = EXCLUDED.first_name,
                 last_name     = EXCLUDED.last_name,
-                raw_fields    = EXCLUDED.raw_fields,
-                source        = EXCLUDED.source
+                raw_fields    = EXCLUDED.raw_fields
         """, (
             leadgen_id, form_id, form_name, campaign_id, campaign_name,
             phone_number, email, first_name, last_name,
-            json.dumps(raw_fields),source
+            json.dumps(raw_fields)
         ))
         conn.commit()
-        print(f"[Meta PG] Lead saved: leadgen_id={leadgen_id} form_name={form_name}")
+        print(f"[Meta PG] Saved: phone={phone_number} form='{form_name}' leadgen_id={leadgen_id}")
+        return {
+            "saved":     True,
+            "duplicate": False,
+            "reason":    None
+        }
+
     except Exception as e:
         print(f"[Meta PG] Failed to save lead {leadgen_id}: {e}")
+        return {
+            "saved":     False,
+            "duplicate": False,
+            "reason":    str(e)
+        }
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()   # ← safe — checks before closing
+        if conn:   conn.close()
 
 # ─────────────────────────────────────────────
 # HELPER: parse field_data list → flat dict
@@ -2206,7 +2246,7 @@ async def fetch_campaign_name(ad_id: str) -> tuple[str, str]:
     url = f"https://graph.facebook.com/v19.0/{ad_id}"
     async with httpx.AsyncClient() as client:
         res = await client.get(url, params={
-            "access_token": PAGE_ACCESS_TOKEN,
+            "access_token": SUPER_USER_TOKEN,
             "fields": "campaign_id,campaign{name}"
         })
         print(f"[fetch_campaign_name] status={res.status_code} body={res.text}")
@@ -2222,6 +2262,41 @@ async def fetch_campaign_name(ad_id: str) -> tuple[str, str]:
 # ─────────────────────────────────────────────
 def push_lead_to_vicidial(phone: str, first_name: str, last_name: str,
                            email: str, list_id: str) -> dict:
+    """
+    last_name is used to store form_name in VICIdial.
+    Duplicate = same phone_number AND same last_name (form_name).
+    """
+    try:
+        conn   = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+
+        # ── Duplicate: same phone + same form (last_name stores form_name) ──
+        cursor.execute(
+            """
+            SELECT lead_id FROM vicidial_list 
+            WHERE phone_number = %s AND last_name = %s 
+            LIMIT 1
+            """,
+            (phone, last_name)   # last_name = form_name passed by caller
+        )
+        existing = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        if existing:
+            print(f"[push_lead] DUPLICATE — phone={phone} form='{last_name}' "
+                  f"already in vicidial_list (lead_id={existing[0]})")
+            return {
+                "success":  False,
+                "response": f"DUPLICATE: phone {phone} already in form '{last_name}' "
+                            f"(lead_id={existing[0]})",
+                "skipped":  True,
+                "duplicate": True
+            }
+
+    except Exception as e:
+        print(f"[push_lead] Duplicate check failed: {e}")
+
     params = {
         "source":       SOURCE,
         "user":         vici_user,
@@ -2231,15 +2306,25 @@ def push_lead_to_vicidial(phone: str, first_name: str, last_name: str,
         "phone_code":   "1",
         "list_id":      list_id,
         "first_name":   first_name,
-        "last_name":    last_name,
+        "last_name":    last_name,   # ← stores form_name
         "email":        email,
     }
     try:
-        res = requests.get(vicidial_url, params=params, timeout=10)
+        res     = requests.get(vicidial_url, params=params, timeout=10)
         success = "SUCCESS" in res.text.upper()
-        return {"success": success, "response": res.text}
+        return {
+            "success":   success,
+            "response":  res.text,
+            "skipped":   False,
+            "duplicate": False
+        }
     except Exception as e:
-        return {"success": False, "response": str(e)}
+        return {
+            "success":   False,
+            "response":  str(e),
+            "skipped":   False,
+            "duplicate": False
+        }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2320,8 +2405,13 @@ async def receive_facebook_webhook(request: Request):
                     first_name = parts[0]
                     last_name  = parts[1] if len(parts) > 1 else ""
 
-                # 3) Save to PostgreSQL
-                save_meta_lead_to_pg(
+                # ── Prepare values ────────────────────────────────────────
+                last_name_for_vici = f"{form_name}".strip()
+                list_id            = META_DEFAULT_LIST_ID
+                campaign_id        = META_DEFAULT_CAMP_ID
+
+                # 3) Save to PostgreSQL — checks duplicate by phone + form_name
+                pg_result = save_meta_lead_to_pg(
                     leadgen_id    = leadgen_id,
                     form_id       = form_id,
                     form_name     = form_name,
@@ -2333,12 +2423,7 @@ async def receive_facebook_webhook(request: Request):
                     last_name     = last_name,
                     raw_fields    = fields,
                     source        = "FaceBook"
-                    
                 )
-
-                last_name   = f"{form_name}".strip()
-                list_id     = META_DEFAULT_LIST_ID
-                campaign_id = META_DEFAULT_CAMP_ID
 
                 # 4) Validate phone
                 if not phone or not phone.isdigit():
@@ -2350,7 +2435,19 @@ async def receive_facebook_webhook(request: Request):
                     })
                     continue
 
-                # 5) Validate list belongs to campaign
+                # 5) If duplicate in PG, skip VICIdial too
+                if pg_result["duplicate"]:
+                    print(f"[Meta Webhook] DUPLICATE — phone={phone} form='{form_name}' skipping VICIdial")
+                    results.append({
+                        "leadgen_id":  leadgen_id,
+                        "phone":       phone,
+                        "form_name":   form_name,
+                        "pg_result":   pg_result,
+                        "vici_result": {"skipped": True, "duplicate": True, "reason": pg_result["reason"]}
+                    })
+                    continue
+
+                # 6) Validate list belongs to campaign
                 if list_id and campaign_id:
                     if not validate_list_campaign(list_id, campaign_id):
                         print(f"[Meta Webhook] list_id {list_id} not valid for campaign {campaign_id}")
@@ -2360,23 +2457,26 @@ async def receive_facebook_webhook(request: Request):
                         })
                         continue
 
-                # 6) Push to VICIdial
+                # 7) Push to VICIdial
                 vici_result = push_lead_to_vicidial(
-                    phone=phone, first_name=first_name,
-                    last_name=last_name, email=email,
-                    list_id=list_id
+                    phone      = phone,
+                    first_name = first_name,
+                    last_name  = last_name_for_vici,
+                    email      = email,
+                    list_id    = list_id
                 )
 
-                print(f"[Meta Webhook] VICIdial result for {phone}: {vici_result}")
+                print(f"[Meta Webhook] pg={pg_result} vici={vici_result}")
                 results.append({
                     "leadgen_id":    leadgen_id,
                     "form_name":     form_name,
                     "campaign_name": meta_campaign_name,
                     "phone":         phone,
                     "first_name":    first_name,
-                    "last_name":     last_name,
+                    "last_name":     last_name_for_vici,
                     "email":         email,
                     "list_id":       list_id,
+                    "pg_result":     pg_result,
                     "vici_result":   vici_result
                 })
 
@@ -2469,7 +2569,11 @@ async def manual_meta_lead_upload(
         first_name = parts[0]
         last_name  = parts[1] if len(parts) > 1 else ""
 
-    save_meta_lead_to_pg(
+    last_name_for_vici = f"{form_name}".strip()
+    list_id            = META_DEFAULT_LIST_ID
+    campaign_id        = META_DEFAULT_CAMP_ID
+
+    pg_result = save_meta_lead_to_pg(
         leadgen_id    = leadgen_id,
         form_id       = form_id,
         form_name     = form_name,
@@ -2483,21 +2587,29 @@ async def manual_meta_lead_upload(
         source        = "manual"
     )
 
-    last_name   = f"{form_name}".strip()
-    list_id     = META_DEFAULT_LIST_ID
-    campaign_id = META_DEFAULT_CAMP_ID
-
     if not phone or not phone.isdigit():
         raise HTTPException(status_code=400, detail=f"Invalid phone: '{phone}' | Raw fields: {fields}")
+
+    # If duplicate, return info without pushing to VICIdial
+    if pg_result["duplicate"]:
+        return {
+            "leadgen_id":  leadgen_id,
+            "form_name":   form_name,
+            "phone":       phone,
+            "pg_result":   pg_result,
+            "vici_result": {"skipped": True, "duplicate": True, "reason": pg_result["reason"]}
+        }
 
     if list_id and campaign_id:
         if not validate_list_campaign(list_id, campaign_id):
             raise HTTPException(status_code=400, detail=f"list_id {list_id} not valid for campaign {campaign_id}")
 
     result = push_lead_to_vicidial(
-        phone=phone, first_name=first_name,
-        last_name=last_name, email=email,
-        list_id=list_id
+        phone      = phone,
+        first_name = first_name,
+        last_name  = last_name_for_vici,
+        email      = email,
+        list_id    = list_id
     )
 
     return {
@@ -2515,4 +2627,917 @@ async def manual_meta_lead_upload(
     }
 
 
+
+# ═══════════════════════════════════════════════════════════════
+#  META BULK HISTORICAL LEADS SYNC
+# ═══════════════════════════════════════════════════════════════
+
+class BulkSyncResult(BaseModel):
+    total_fetched:  int
+    saved_to_pg:    int
+    pushed_to_vici: int
+    skipped:        int
+    failed:         list
+
+
+@app.get("/meta/get-forms")
+async def get_meta_forms(
+    page_id:      str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Step 1: Call this to list all Lead Ad forms for your Facebook Page.
+    Copy the form `id` from the response and use it in /meta/sync-historical-leads
+    """
+    url = f"https://graph.facebook.com/v19.0/{page_id}/leadgen_forms"
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url, params={
+            "access_token": SUPER_USER_TOKEN,
+            "fields":       "id,name,status,leads_count,created_time",
+            "limit":        50
+        }, timeout=15)
+
+    if res.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Meta Graph API error {res.status_code}: {res.text}"
+        )
+
+    data  = res.json()
+    forms = data.get("data", [])
+    return {
+        "page_id":    page_id,
+        "form_count": len(forms),
+        "forms":      forms
+    }
+
+
+@app.post("/meta/sync-historical-leads")
+async def sync_historical_leads(
+    form_id:   str,
+    limit:     int  = 100,    # Meta max per page is 100
+    after:     str  = None,   # pagination cursor from previous response
+    push_vici: bool = True,   # False = only save to PG, skip VICIdial
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Step 2: Fetches ALL existing leads from a Meta Lead Form.
+    
+    What this does:
+      1. Calls Meta Graph API  → GET /{form_id}/leads
+      2. Saves every lead      → PostgreSQL  meta_leads table  (ON CONFLICT = upsert, safe to re-run)
+      3. Pushes to VICIdial    → non_agent_api.php  add_lead   (same path as your live webhook)
+
+    Pagination: if has_more=true in the response, call again with after=<next_cursor>
+    """
+
+    all_results    = []
+    saved_to_pg    = 0
+    pushed_to_vici = 0
+    skipped        = 0
+    failed         = []
+    next_cursor    = None
+
+    # ─────────────────────────────────────────────────────────
+    # 1. Pull one page of leads from Meta Graph API
+    # ─────────────────────────────────────────────────────────
+    url    = f"https://graph.facebook.com/v19.0/{form_id}/leads"
+    params = {
+        "access_token": SUPER_USER_TOKEN,
+        "fields":       "id,field_data,created_time,ad_id,ad_name,form_id",
+        "limit":        limit,
+    }
+    if after:
+        params["after"] = after
+
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url, params=params, timeout=30)
+
+    if res.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Meta Graph API error {res.status_code}: {res.text}"
+        )
+
+    data        = res.json()
+    leads_list  = data.get("data", [])
+    paging      = data.get("paging", {})
+    cursors     = paging.get("cursors", {})
+    next_cursor = cursors.get("after") if paging.get("next") else None
+
+    print(f"[Bulk Sync] Fetched {len(leads_list)} leads from form_id={form_id}")
+
+    if not leads_list:
+        return {
+            "form_id":        form_id,
+            "total_fetched":  0,
+            "saved_to_pg":    0,
+            "pushed_to_vici": 0,
+            "skipped":        0,
+            "failed_count":   0,
+            "failed":         [],
+            "next_cursor":    None,
+            "has_more":       False,
+            "results":        [],
+            "message":        "No leads found for this form."
+        }
+
+    # ─────────────────────────────────────────────────────────
+    # Fetch form name once (same for all leads on this form)
+    # ─────────────────────────────────────────────────────────
+    shared_form_name = await fetch_form_name(form_id)
+    print(f"[Bulk Sync] Form name resolved: '{shared_form_name}'")
+
+    # ─────────────────────────────────────────────────────────
+    # 2. Process each lead
+    # ─────────────────────────────────────────────────────────
+    for lead in leads_list:
+        leadgen_id = lead.get("id")
+        if not leadgen_id:
+            skipped += 1
+            continue
+
+        try:
+            # ── Parse fields ─────────────────────────────────
+            field_data   = lead.get("field_data", [])
+            fields       = parse_lead_fields(field_data)          # your existing helper
+            lead_form_id = lead.get("form_id", form_id)
+            ad_id        = lead.get("ad_id", "")
+
+            # Use cached form name; only re-fetch if lead has a different form_id
+            if lead_form_id == form_id:
+                form_name = shared_form_name
+            else:
+                form_name = await fetch_form_name(lead_form_id)
+
+            # Fetch Meta campaign name from ad_id
+            meta_campaign_id, meta_campaign_name = ("", "")
+            if ad_id:
+                meta_campaign_id, meta_campaign_name = await fetch_campaign_name(ad_id)
+
+            # ── Extract contact fields ────────────────────────
+            phone = clean_phone(                                   # your existing helper
+                fields.get("phone_number")
+                or fields.get("phone")
+                or fields.get("mobile_number")
+                or fields.get("phone_number_wa")
+                or ""
+            )
+            first_name = fields.get("first_name", "").strip()
+            last_name  = fields.get("last_name",  "").strip()
+            full_name  = fields.get("full_name",  "").strip()
+            email      = fields.get("email",      "").strip()
+
+            # Split full_name if individual names not provided
+            if not first_name and full_name:
+                parts      = full_name.split(" ", 1)
+                first_name = parts[0]
+                last_name  = parts[1] if len(parts) > 1 else ""
+
+            print(f"[Bulk Sync] Processing: leadgen_id={leadgen_id} phone={phone} name={first_name} {last_name}")
+
+            # ─────────────────────────────────────────────────
+            # 3. Save to PostgreSQL
+            #    Uses ON CONFLICT (leadgen_id) DO UPDATE
+            #    → safe to re-run, will upsert existing records
+            # ─────────────────────────────────────────────────
+            pg_result = save_meta_lead_to_pg(
+                leadgen_id    = leadgen_id,
+                form_id       = lead_form_id,
+                form_name     = form_name,
+                campaign_id   = meta_campaign_id,
+                campaign_name = meta_campaign_name,
+                phone_number  = phone,
+                email         = email,
+                first_name    = first_name,
+                last_name     = last_name,
+                raw_fields    = fields,
+                source        = "historical_sync"
+            )
+
+            if pg_result["saved"]:
+                saved_to_pg += 1
+
+            result_entry = {
+                "leadgen_id":    leadgen_id,
+                "form_name":     form_name,
+                "campaign_name": meta_campaign_name,
+                "phone":         phone,
+                "first_name":    first_name,
+                "last_name":     last_name,
+                "email":         email,
+                "pg_result":     pg_result,
+                "vici_result":   None,
+            }
+
+            # If duplicate in PG, skip VICIdial
+            if pg_result["duplicate"]:
+                print(f"[Bulk Sync] DUPLICATE — phone={phone} form='{form_name}' skipping")
+                skipped += 1
+                all_results.append(result_entry)
+                continue
+
+            if push_vici:
+                if not phone or not phone.isdigit():
+                    result_entry["vici_result"] = f"skipped: invalid phone '{phone}'"
+                    skipped += 1
+                    all_results.append(result_entry)
+                    continue
+
+                list_id = META_DEFAULT_LIST_ID
+                camp_id = META_DEFAULT_CAMP_ID
+
+                if list_id and camp_id:
+                    if not validate_list_campaign(list_id, camp_id):
+                        result_entry["vici_result"] = f"skipped: list_id {list_id} not valid for campaign {camp_id}"
+                        skipped += 1
+                        all_results.append(result_entry)
+                        continue
+
+                last_name_for_vici = f"{form_name}".strip()
+
+                vici_result = push_lead_to_vicidial(
+                    phone      = phone,
+                    first_name = first_name,
+                    last_name  = last_name_for_vici,
+                    email      = email,
+                    list_id    = list_id
+                )
+
+                result_entry["vici_result"] = vici_result
+
+                if vici_result.get("success"):
+                    pushed_to_vici += 1
+                elif vici_result.get("duplicate"):
+                    skipped += 1
+                else:
+                    skipped += 1
+
+            all_results.append(result_entry)
+
+        except Exception as e:
+            print(f"[Bulk Sync] Error on leadgen_id={leadgen_id}: {e}")
+            failed.append({"leadgen_id": leadgen_id, "error": str(e)})
+
+    # ─────────────────────────────────────────────────────────
+    # 5. Return summary + pagination cursor for next page
+    # ─────────────────────────────────────────────────────────
+    return {
+        "form_id":        form_id,
+        "form_name":      shared_form_name,
+        "total_fetched":  len(leads_list),
+        "saved_to_pg":    saved_to_pg,
+        "pushed_to_vici": pushed_to_vici,
+        "skipped":        skipped,
+        "failed_count":   len(failed),
+        "failed":         failed,
+        "next_cursor":    next_cursor,
+        "has_more":       next_cursor is not None,
+        "tip":            "If has_more=true, call again with after=<next_cursor> to get the next page",
+        "results":        all_results,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# AUTO-PAGINATE: syncs ALL pages in one call (use carefully
+# on large datasets — can take several minutes)
+# ─────────────────────────────────────────────────────────────
+@app.post("/meta/sync-all-historical-leads")
+async def sync_all_historical_leads(
+    form_id:   str,
+    push_vici: bool = True,
+    current_user: dict = Depends(get_current_user)
+):
+    total_fetched  = 0
+    total_pg       = 0
+    total_vici     = 0
+    total_skipped  = 0
+    all_failed     = []
+    cursor         = None
+    page_num       = 0
+
+    while True:
+        page_num += 1
+        print(f"[Sync All] Page {page_num}, cursor={cursor}")
+
+        url    = f"https://graph.facebook.com/v19.0/{form_id}/leads"
+        params = {
+            "access_token": SUPER_USER_TOKEN,
+            "fields":       "id,field_data,created_time,ad_id,ad_name,form_id",
+            "limit":        100,
+        }
+        if cursor:
+            params["after"] = cursor
+
+        async with httpx.AsyncClient() as client:
+            res = await client.get(url, params=params, timeout=30)
+
+        if res.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Meta API error: {res.text}")
+
+        data       = res.json()
+        leads_list = data.get("data", [])
+        paging     = data.get("paging", {})
+        cursors    = paging.get("cursors", {})
+        next_c     = cursors.get("after") if paging.get("next") else None
+
+        if not leads_list:
+            break
+
+        shared_form_name = await fetch_form_name(form_id)
+
+        for lead in leads_list:
+            leadgen_id = lead.get("id")
+            if not leadgen_id:
+                total_skipped += 1
+                continue
+            try:
+                field_data   = lead.get("field_data", [])
+                fields       = parse_lead_fields(field_data)
+                lead_form_id = lead.get("form_id", form_id)
+                ad_id        = lead.get("ad_id", "")
+                form_name    = shared_form_name if lead_form_id == form_id else await fetch_form_name(lead_form_id)
+
+                meta_campaign_id, meta_campaign_name = ("", "")
+                if ad_id:
+                    meta_campaign_id, meta_campaign_name = await fetch_campaign_name(ad_id)
+
+                phone = clean_phone(
+                    fields.get("phone_number") or fields.get("phone")
+                    or fields.get("mobile_number") or fields.get("phone_number_wa") or ""
+                )
+                first_name = fields.get("first_name", "").strip()
+                last_name  = fields.get("last_name",  "").strip()
+                full_name  = fields.get("full_name",  "").strip()
+                email      = fields.get("email",      "").strip()
+
+                if not first_name and full_name:
+                    parts      = full_name.split(" ", 1)
+                    first_name = parts[0]
+                    last_name  = parts[1] if len(parts) > 1 else ""
+
+                # ── Save to PostgreSQL ────────────────────────────────
+                pg_result = save_meta_lead_to_pg(
+                    leadgen_id    = leadgen_id,
+                    form_id       = lead_form_id,
+                    form_name     = form_name,
+                    campaign_id   = meta_campaign_id,
+                    campaign_name = meta_campaign_name,
+                    phone_number  = phone,
+                    email         = email,
+                    first_name    = first_name,
+                    last_name     = last_name,
+                    raw_fields    = fields,
+                    source        = "historical_sync"
+                )
+
+                total_fetched += 1                  # always count fetched
+                if pg_result["saved"]:
+                    total_pg += 1                   # only count if actually saved
+
+                # ── Skip VICIdial if duplicate phone+form ─────────────
+                if pg_result["duplicate"]:
+                    print(f"[Sync All] DUPLICATE — phone={phone} form='{form_name}' skipping")
+                    total_skipped += 1
+                    continue
+
+                # ── Push to VICIdial ──────────────────────────────────
+                if push_vici and phone and phone.isdigit():
+                    list_id = META_DEFAULT_LIST_ID
+                    camp_id = META_DEFAULT_CAMP_ID
+                    if list_id and camp_id:
+                        if not validate_list_campaign(list_id, camp_id):
+                            total_skipped += 1
+                        else:
+                            vici_result = push_lead_to_vicidial(
+                                phone      = phone,
+                                first_name = first_name,
+                                last_name  = form_name.strip(),
+                                email      = email,
+                                list_id    = list_id
+                            )
+                            if vici_result.get("success"):
+                                total_vici += 1
+                            else:
+                                total_skipped += 1
+                    else:
+                        vici_result = push_lead_to_vicidial(
+                            phone      = phone,
+                            first_name = first_name,
+                            last_name  = form_name.strip(),
+                            email      = email,
+                            list_id    = list_id
+                        )
+                        if vici_result.get("success"):
+                            total_vici += 1
+                        else:
+                            total_skipped += 1
+                elif push_vici:
+                    total_skipped += 1
+
+            except Exception as e:
+                all_failed.append({"leadgen_id": leadgen_id, "error": str(e)})
+
+        if not next_c:
+            break
+        cursor = next_c
+
+    return {
+        "form_id":        form_id,
+        "pages_fetched":  page_num,
+        "total_fetched":  total_fetched,
+        "saved_to_pg":    total_pg,
+        "pushed_to_vici": total_vici,
+        "skipped":        total_skipped,
+        "failed_count":   len(all_failed),
+        "failed":         all_failed,
+    }
+
+
+async def catchup_form(form_id: str, since_iso: str) -> dict:
+    total_pg      = 0
+    total_vici    = 0
+    total_skipped = 0
+    all_failed    = []
+    page_num      = 0
+    cursor        = None
+
+    try:
+        dt_since   = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
+        since_unix = int(dt_since.timestamp())
+    except Exception:
+        since_unix = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp())
+
+    print(f"[Catchup] Form {form_id} — fetching leads since {since_iso} (unix={since_unix})")
+
+    shared_form_name = await fetch_form_name(form_id)
+
+    while True:
+        page_num += 1
+        url    = f"https://graph.facebook.com/v19.0/{form_id}/leads"
+        params = {
+            "access_token": SUPER_USER_TOKEN,
+            "fields":       "id,field_data,created_time,ad_id,ad_name,form_id",
+            "limit":        100,
+            "since":        since_unix,
+        }
+        if cursor:
+            params["after"] = cursor
+
+        try:
+            async with httpx.AsyncClient() as client:
+                res = await client.get(url, params=params, timeout=30)
+
+            if res.status_code != 200:
+                print(f"[Catchup] Meta API error for form {form_id}: {res.status_code} {res.text}")
+                break
+
+            data       = res.json()
+            leads_list = data.get("data", [])
+            paging     = data.get("paging", {})
+            cursors_pg = paging.get("cursors", {})
+            next_c     = cursors_pg.get("after") if paging.get("next") else None
+
+            print(f"[Catchup] Form {form_id} page {page_num}: {len(leads_list)} leads")
+
+            if not leads_list:
+                break
+
+            for lead in leads_list:
+                leadgen_id = lead.get("id")
+                if not leadgen_id:
+                    total_skipped += 1
+                    continue
+
+                try:
+                    field_data   = lead.get("field_data", [])
+                    fields       = parse_lead_fields(field_data)
+                    lead_form_id = lead.get("form_id", form_id)
+                    ad_id        = lead.get("ad_id", "")
+
+                    form_name = (
+                        shared_form_name
+                        if lead_form_id == form_id
+                        else await fetch_form_name(lead_form_id)
+                    )
+
+                    meta_campaign_id, meta_campaign_name = ("", "")
+                    if ad_id:
+                        meta_campaign_id, meta_campaign_name = await fetch_campaign_name(ad_id)
+
+                    phone = clean_phone(
+                        fields.get("phone_number") or fields.get("phone")
+                        or fields.get("mobile_number") or fields.get("phone_number_wa") or ""
+                    )
+                    first_name = fields.get("first_name", "").strip()
+                    last_name  = fields.get("last_name",  "").strip()
+                    full_name  = fields.get("full_name",  "").strip()
+                    email      = fields.get("email",      "").strip()
+
+                    if not first_name and full_name:
+                        parts      = full_name.split(" ", 1)
+                        first_name = parts[0]
+                        last_name  = parts[1] if len(parts) > 1 else ""
+
+                    # ── Save to PostgreSQL ────────────────────────────
+                    pg_result = save_meta_lead_to_pg(
+                        leadgen_id    = leadgen_id,
+                        form_id       = lead_form_id,
+                        form_name     = form_name,
+                        campaign_id   = meta_campaign_id,
+                        campaign_name = meta_campaign_name,
+                        phone_number  = phone,
+                        email         = email,
+                        first_name    = first_name,
+                        last_name     = last_name,
+                        raw_fields    = fields,
+                        source        = "startup_catchup"
+                    )
+
+                    if pg_result["saved"]:
+                        total_pg += 1
+
+                    # ── Skip VICIdial if duplicate phone+form ─────────
+                    if pg_result["duplicate"]:
+                        print(f"[Catchup] DUPLICATE — phone={phone} form='{form_name}' skipping VICIdial")
+                        total_skipped += 1
+                        continue
+
+                    # ── Push to VICIdial ──────────────────────────────
+                    if phone and phone.isdigit():
+                        list_id = META_DEFAULT_LIST_ID
+                        camp_id = META_DEFAULT_CAMP_ID
+
+                        can_push = True
+                        if list_id and camp_id:
+                            if not validate_list_campaign(list_id, camp_id):
+                                print(f"[Catchup] list/campaign mismatch for {phone}, skipping VICIdial")
+                                can_push      = False
+                                total_skipped += 1
+
+                        if can_push:
+                            vici_result = push_lead_to_vicidial(
+                                phone      = phone,
+                                first_name = first_name,
+                                last_name  = form_name.strip(),
+                                email      = email,
+                                list_id    = list_id
+                            )
+                            if vici_result.get("success"):
+                                total_vici += 1
+                                print(f"[Catchup] VICIdial OK: {phone}")
+                            else:
+                                total_skipped += 1
+                                print(f"[Catchup] VICIdial FAILED: {phone} → {vici_result.get('response')}")
+                    else:
+                        print(f"[Catchup] Invalid phone for {leadgen_id}: '{phone}', saved to PG only")
+                        total_skipped += 1
+
+                except Exception as e:
+                    print(f"[Catchup] Error on lead {leadgen_id}: {e}")
+                    all_failed.append({"leadgen_id": leadgen_id, "error": str(e)})
+
+            if not next_c:
+                break
+            cursor = next_c
+
+        except Exception as e:
+            print(f"[Catchup] Page {page_num} fetch error: {e}")
+            break
+
+    return {
+        "form_id":     form_id,
+        "pages":       page_num,
+        "saved_to_pg": total_pg,
+        "pushed_vici": total_vici,
+        "skipped":     total_skipped,
+        "failed":      len(all_failed),
+    }
+
+
+# ─────────────────────────────────────────────
+# HELPER: get the last time we successfully synced
+# Stored in PostgreSQL so it survives restarts
+# ─────────────────────────────────────────────
+def get_last_sync_time() -> str:
+    """Returns ISO timestamp of last successful sync, or 24h ago if never synced"""
+    try:
+        conn   = get_pg_conn()
+        cursor = conn.cursor()
+
+        # Create the tracking table if it doesn't exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS meta_sync_tracker (
+                id           SERIAL PRIMARY KEY,
+                form_id      TEXT NOT NULL UNIQUE,
+                last_sync_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                total_synced INTEGER DEFAULT 0
+            )
+        """)
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"[Sync Tracker] Table setup error: {e}")
+
+def get_form_last_sync(form_id: str) -> str:
+    """Returns ISO timestamp string for a specific form's last sync"""
+    seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    try:
+        conn   = get_pg_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT last_sync_at FROM meta_sync_tracker WHERE form_id = %s",
+            (form_id,)
+        )
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        if row:
+            # Return the stored timestamp
+            return row[0].isoformat()
+        else:
+            # Never synced — go back 7 days to be safe
+            seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
+            return seven_days_ago.isoformat()
+
+    except Exception as e:
+        print(f"[Sync Tracker] Error reading last sync: {e}")
+        # Fallback: 24 hours ago
+        return (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+def update_form_last_sync(form_id: str, count: int):
+    """Updates the last sync timestamp for a form"""
+    try:
+        conn   = get_pg_conn()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO meta_sync_tracker (form_id, last_sync_at, total_synced)
+            VALUES (%s, NOW(), %s)
+            ON CONFLICT (form_id) DO UPDATE SET
+                last_sync_at = NOW(),
+                total_synced = meta_sync_tracker.total_synced + EXCLUDED.total_synced
+        """, (form_id, count))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print(f"[Sync Tracker] Updated last_sync for form_id={form_id}, added {count} leads")
+    except Exception as e:
+        print(f"[Sync Tracker] Error updating last sync: {e}")
+
+
+# # ─────────────────────────────────────────────
+# # CORE: fetch missed leads for ONE form
+# # using since= parameter (Meta supports this)
+# # ─────────────────────────────────────────────
+# async def catchup_form(form_id: str, since_iso: str) -> dict:
+#     """
+#     Fetches all leads from a form created AFTER since_iso timestamp.
+#     Meta Graph API supports ?since= for time-based filtering.
+#     """
+#     total_pg      = 0
+#     total_vici    = 0
+#     total_skipped = 0
+#     all_failed    = []
+#     page_num      = 0
+#     cursor        = None
+
+#     # Convert ISO string to Unix timestamp for Meta API
+#     try:
+#         dt_since   = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
+#         since_unix = int(dt_since.timestamp())
+#     except Exception:
+#         since_unix = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp())
+
+#     print(f"[Catchup] Form {form_id} — fetching leads since {since_iso} (unix={since_unix})")
+
+#     shared_form_name = await fetch_form_name(form_id)
+
+#     while True:
+#         page_num += 1
+#         url    = f"https://graph.facebook.com/v19.0/{form_id}/leads"
+#         params = {
+#             "access_token": SUPER_USER_TOKEN,
+#             "fields":       "id,field_data,created_time,ad_id,ad_name,form_id",
+#             "limit":        100,
+#             "since":        since_unix,   # ← Meta filters by created_time >= since
+#         }
+#         if cursor:
+#             params["after"] = cursor
+
+#         try:
+#             async with httpx.AsyncClient() as client:
+#                 res = await client.get(url, params=params, timeout=30)
+
+#             if res.status_code != 200:
+#                 print(f"[Catchup] Meta API error for form {form_id}: {res.status_code} {res.text}")
+#                 break
+
+#             data       = res.json()
+#             leads_list = data.get("data", [])
+#             paging     = data.get("paging", {})
+#             cursors_pg = paging.get("cursors", {})
+#             next_c     = cursors_pg.get("after") if paging.get("next") else None
+
+#             print(f"[Catchup] Form {form_id} page {page_num}: {len(leads_list)} leads")
+
+#             if not leads_list:
+#                 break
+
+#             for lead in leads_list:
+#                 leadgen_id = lead.get("id")
+#                 if not leadgen_id:
+#                     total_skipped += 1
+#                     continue
+
+#                 try:
+#                     field_data   = lead.get("field_data", [])
+#                     fields       = parse_lead_fields(field_data)
+#                     lead_form_id = lead.get("form_id", form_id)
+#                     ad_id        = lead.get("ad_id", "")
+
+#                     form_name = (
+#                         shared_form_name
+#                         if lead_form_id == form_id
+#                         else await fetch_form_name(lead_form_id)
+#                     )
+
+#                     meta_campaign_id, meta_campaign_name = ("", "")
+#                     if ad_id:
+#                         meta_campaign_id, meta_campaign_name = await fetch_campaign_name(ad_id)
+
+#                     phone = clean_phone(
+#                         fields.get("phone_number") or fields.get("phone")
+#                         or fields.get("mobile_number") or fields.get("phone_number_wa") or ""
+#                     )
+#                     first_name = fields.get("first_name", "").strip()
+#                     last_name  = fields.get("last_name",  "").strip()
+#                     full_name  = fields.get("full_name",  "").strip()
+#                     email      = fields.get("email",      "").strip()
+
+#                     if not first_name and full_name:
+#                         parts      = full_name.split(" ", 1)
+#                         first_name = parts[0]
+#                         last_name  = parts[1] if len(parts) > 1 else ""
+
+#                     # ── Save to PostgreSQL (upsert — safe to re-run) ──
+#                     pg_result = save_meta_lead_to_pg(
+#                         leadgen_id    = leadgen_id,
+#                         form_id       = lead_form_id,
+#                         form_name     = form_name,
+#                         campaign_id   = meta_campaign_id,
+#                         campaign_name = meta_campaign_name,
+#                         phone_number  = phone,
+#                         email         = email,
+#                         first_name    = first_name,
+#                         last_name     = last_name,
+#                         raw_fields    = fields,
+#                         source        = "startup_catchup"
+#                     )
+#                     if pg_result["saved"]:
+#                         total_pg += 1
+#                     # Skip VICIdial if duplicate phone+form
+#                     if pg_result["duplicate"]:
+#                         print(f"[Catchup] DUPLICATE — phone={phone} form='{form_name}' skipping VICIdial")
+#                         total_skipped += 1
+#                         continue  # ← skip the push block below ✅
+
+#                     # ── Push to VICIdial ──────────────────────────────
+#                     if phone and phone.isdigit():
+#                         list_id = META_DEFAULT_LIST_ID
+#                         camp_id = META_DEFAULT_CAMP_ID
+
+#                         can_push = True
+#                         if list_id and camp_id:
+#                             if not validate_list_campaign(list_id, camp_id):
+#                                 print(f"[Catchup] list/campaign mismatch for {phone}, skipping VICIdial")
+#                                 can_push = False
+#                                 total_skipped += 1
+
+#                         if can_push:
+#                             vici_result = push_lead_to_vicidial(
+#                                 phone      = phone,
+#                                 first_name = first_name,
+#                                 last_name  = form_name.strip(),
+#                                 email      = email,
+#                                 list_id    = list_id
+#                             )
+#                             if vici_result.get("success"):
+#                                 total_vici += 1
+#                                 print(f"[Catchup] VICIdial OK: {phone}")
+#                             else:
+#                                 total_skipped += 1
+#                                 print(f"[Catchup] VICIdial FAILED: {phone} → {vici_result.get('response')}")
+#                     else:
+#                         print(f"[Catchup] Invalid phone for {leadgen_id}: '{phone}', saved to PG only")
+#                         total_skipped += 1
+
+#                 except Exception as e:
+#                     print(f"[Catchup] Error on lead {leadgen_id}: {e}")
+#                     all_failed.append({"leadgen_id": leadgen_id, "error": str(e)})
+
+#             if not next_c:
+#                 break
+#             cursor = next_c
+
+#         except Exception as e:
+#             print(f"[Catchup] Page {page_num} fetch error: {e}")
+#             break
+
+#     return {
+#         "form_id":     form_id,
+#         "pages":       page_num,
+#         "saved_to_pg": total_pg,
+#         "pushed_vici": total_vici,
+#         "skipped":     total_skipped,
+#         "failed":      len(all_failed),
+#     }
+
+
+
+# ─────────────────────────────────────────────
+# STARTUP EVENT: runs automatically on boot
+# ─────────────────────────────────────────────
+@app.on_event("startup")
+async def startup():
+    print("[Startup] Application started.")
+    return
+    # Only run catchup if SUPER_USER_TOKEN and forms are configured
+    if not SUPER_USER_TOKEN:
+        print("[Startup] No SUPER_USER_TOKEN set — skipping Meta catchup.")
+        return
+
+    # ── Get your Facebook Page ID from .env ──────────────────
+    page_id = os.getenv("META_PAGE_ID", "")
+    if not page_id:
+        print("[Startup] META_PAGE_ID not set in .env — skipping Meta catchup.")
+        print("[Startup] Add META_PAGE_ID=your_page_id to your .env file.")
+        return
+
+    print(f"[Startup] Starting Meta lead catchup for page_id={page_id}")
+
+    # ── Setup tracking table ──────────────────────────────────
+    get_last_sync_time()
+
+    try:
+        # 1. Get all active forms for this page
+        async with httpx.AsyncClient() as client:
+            res = await client.get(
+                f"https://graph.facebook.com/v19.0/{page_id}/leadgen_forms",
+                params={
+                    "access_token": PAGE_ACCESS_TOKEN,
+                    "fields":       "id,name,status,leads_count",
+                    "limit":        50
+                },
+                timeout=15
+            )
+
+        if res.status_code != 200:
+            print(f"[Startup] Failed to fetch forms: {res.status_code} {res.text}")
+            return
+
+        forms = res.json().get("data", [])
+        print(f"[Startup] Found {len(forms)} forms to check")
+
+        total_summary = []
+
+        # 2. For each form, fetch leads missed since last sync
+        for form in forms:
+            form_id   = form.get("id")
+            form_name = form.get("name", "Unknown")
+            leads_count = form.get("leads_count", 0)
+
+            if not form_id:
+                continue
+
+            print(f"[Startup] Checking form: '{form_name}' (id={form_id}, total_leads={leads_count})")
+
+            # Get when we last synced this form
+            since_iso = get_form_last_sync(form_id)
+            print(f"[Startup] Last sync for '{form_name}': {since_iso}")
+
+            # Fetch and insert missed leads
+            result = await catchup_form(form_id, since_iso)
+            total_summary.append({**result, "form_name": form_name})
+
+            # Update the last sync timestamp for this form
+            update_form_last_sync(form_id, result["saved_to_pg"])
+
+            print(f"[Startup] Form '{form_name}' done: "
+                  f"pg={result['saved_to_pg']} "
+                  f"vici={result['pushed_vici']} "
+                  f"skipped={result['skipped']} "
+                  f"failed={result['failed']}")
+
+        # 3. Print overall summary
+        total_pg   = sum(r["saved_to_pg"] for r in total_summary)
+        total_vici = sum(r["pushed_vici"] for r in total_summary)
+        print(f"\n[Startup] ✅ Catchup complete — "
+              f"Total saved to PG: {total_pg}, "
+              f"Total pushed to VICIdial: {total_vici}")
+
+    except Exception as e:
+        print(f"[Startup] Catchup error: {e}")
+        # Don't crash the server — just log and continue
 

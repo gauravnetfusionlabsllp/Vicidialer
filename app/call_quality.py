@@ -69,6 +69,7 @@ VICIDIAL_LIST_ID  = 7022026
 
 # Google Sheets to upload leads from
 LEAD_SHEETS = [
+    "https://docs.google.com/spreadsheets/d/1nqcTDPVwF1EZ-98mHeJVHaAcgkp5TzEHYErkJ_Lx2DA/edit?gid=382964423#gid=382964423"
     "https://docs.google.com/spreadsheets/d/1zoRdvvdkgwdhqubhna_FsS1N8zbcK7UE9uNKBFqTeTM/edit?gid=0",
     "https://docs.google.com/spreadsheets/d/1kaWWrEYy_00YJrlKH5H04iC0g-_to9CCdTKmnHPYDGY/edit?gid=0",
 ]

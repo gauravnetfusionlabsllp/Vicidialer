@@ -19,7 +19,7 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-
+from dependencies import get_current_user, get_pg_conn
 # ── Re-use your existing helpers (imported from Correct_demo_code) ─────────
 # These are already defined in your Correct_demo_code.py; import them here.
 # If you paste this code directly into Correct_demo_code.py, remove these imports.
@@ -46,7 +46,7 @@ ALLOWED_MIME_TYPES = {
 }
 MAX_FILE_SIZE_MB = 10
 
-email_router = APIRouter(prefix="/admin/email", tags=["Email Templates"])
+email_router = APIRouter(prefix="/email", tags=["Email Templates"])
 
 
 # ─────────────────────────────────────────────
